@@ -3,6 +3,8 @@ package crawler
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -18,6 +20,8 @@ import (
 	"github.com/crawler-monorepo/common/stopwords"
 	"github.com/crawler-monorepo/internal/extractor"
 	"github.com/crawler-monorepo/internal/index"
+	"github.com/crawler-monorepo/internal/storage"
+	"github.com/crawler-monorepo/internal/ui"
 	"github.com/google/uuid"
 	"golang.org/x/time/rate"
 )
@@ -39,6 +43,7 @@ type CrawlRequest struct {
 	AllowLoopback    bool              `json:"allow_loopback,omitempty"`
 	Adaptive         bool              `json:"adaptive,omitempty"`
 	MinPriority      float64           `json:"min_priority,omitempty"`
+	ForceRefresh     bool              `json:"force_refresh,omitempty"`
 }
 
 // CrawlPageResult records the outcome and token savings of an individual crawled page.
@@ -56,19 +61,49 @@ type CrawlPageResult struct {
 
 // CrawlJob tracks the runtime state, atomic counters, and error logs of an active or finished crawl.
 type CrawlJob struct {
-	ID           string             `json:"id"`
-	Status       string             `json:"status"` // "running", "completed", "failed", "cancelled"
-	Request      CrawlRequest       `json:"request"`
-	PagesCrawled atomic.Int64       `json:"pages_crawled"`
-	PagesQueued  atomic.Int64       `json:"pages_queued"`
-	TokensSaved  atomic.Int64       `json:"tokens_saved"`
-	ErrorsCount  atomic.Int64       `json:"errors_count"`
-	RecentErrors []string           `json:"recent_errors"`
-	Results      []CrawlPageResult  `json:"results,omitempty"`
-	StartTime    time.Time          `json:"start_time"`
-	EndTime      *time.Time         `json:"end_time,omitempty"`
-	CancelFunc   context.CancelFunc `json:"-"`
-	mu           sync.RWMutex       `json:"-"`
+	ID           string               `json:"id"`
+	Status       string               `json:"status"` // "running", "completed", "failed", "cancelled"
+	Request      CrawlRequest         `json:"request"`
+	PagesCrawled atomic.Int64         `json:"pages_crawled"`
+	PagesQueued  atomic.Int64         `json:"pages_queued"`
+	TokensSaved  atomic.Int64         `json:"tokens_saved"`
+	ErrorsCount  atomic.Int64         `json:"errors_count"`
+	BytesRead    atomic.Int64         `json:"bytes_read"`
+	CacheHits    atomic.Int64         `json:"cache_hits"`
+	RecentErrors []string             `json:"recent_errors"`
+	Results      []CrawlPageResult    `json:"results,omitempty"`
+	StartTime    time.Time            `json:"start_time"`
+	EndTime      *time.Time           `json:"end_time,omitempty"`
+	CancelFunc   context.CancelFunc   `json:"-"`
+	Broadcaster  *ui.EventBroadcaster `json:"-"`
+	mu           sync.RWMutex         `json:"-"`
+}
+
+func (j *CrawlJob) SubscribeEvents() <-chan ui.ProgressEvent {
+	if j.Broadcaster == nil {
+		ch := make(chan ui.ProgressEvent)
+		close(ch)
+		return ch
+	}
+	return j.Broadcaster.Subscribe()
+}
+
+func (j *CrawlJob) UnsubscribeEvents(ch <-chan ui.ProgressEvent) {
+	if j.Broadcaster != nil {
+		j.Broadcaster.Unsubscribe(ch)
+	}
+}
+
+func (j *CrawlJob) PublishEvent(ev ui.ProgressEvent) {
+	if ev.JobID == "" {
+		ev.JobID = j.ID
+	}
+	if ev.Phase == "" {
+		ev.Phase = "crawling"
+	}
+	if j.Broadcaster != nil {
+		j.Broadcaster.Publish(ev)
+	}
 }
 
 func (j *CrawlJob) AddError(errStr string) {
@@ -115,12 +150,16 @@ func (j *CrawlJob) MarshalJSON() ([]byte, error) {
 		PagesQueued  int64 `json:"pages_queued"`
 		TokensSaved  int64 `json:"tokens_saved"`
 		ErrorsCount  int64 `json:"errors_count"`
+		BytesRead    int64 `json:"bytes_read"`
+		CacheHits    int64 `json:"cache_hits"`
 	}{
 		Alias:        (*Alias)(j),
 		PagesCrawled: j.PagesCrawled.Load(),
 		PagesQueued:  j.PagesQueued.Load(),
 		TokensSaved:  j.TokensSaved.Load(),
 		ErrorsCount:  j.ErrorsCount.Load(),
+		BytesRead:    j.BytesRead.Load(),
+		CacheHits:    j.CacheHits.Load(),
 	})
 }
 
@@ -133,6 +172,8 @@ func (j *CrawlJob) UnmarshalJSON(data []byte) error {
 		PagesQueued  int64 `json:"pages_queued"`
 		TokensSaved  int64 `json:"tokens_saved"`
 		ErrorsCount  int64 `json:"errors_count"`
+		BytesRead    int64 `json:"bytes_read"`
+		CacheHits    int64 `json:"cache_hits"`
 	}{
 		Alias: (*Alias)(j),
 	}
@@ -145,6 +186,8 @@ func (j *CrawlJob) UnmarshalJSON(data []byte) error {
 	j.PagesQueued.Store(aux.PagesQueued)
 	j.TokensSaved.Store(aux.TokensSaved)
 	j.ErrorsCount.Store(aux.ErrorsCount)
+	j.BytesRead.Store(aux.BytesRead)
+	j.CacheHits.Store(aux.CacheHits)
 	return nil
 }
 
@@ -286,10 +329,12 @@ func (m *JobManager) StartCrawl(ctx context.Context, req CrawlRequest) (*CrawlJo
 	jobID := uuid.New().String()
 	jobCtx, jobCancel := context.WithCancel(context.Background())
 
+	broadcaster := ui.NewEventBroadcaster(512)
 	job := &CrawlJob{
 		ID:           jobID,
 		Status:       "running",
 		Request:      req,
+		Broadcaster:  broadcaster,
 		RecentErrors: make([]string, 0),
 		Results:      make([]CrawlPageResult, 0),
 		StartTime:    time.Now(),
@@ -352,6 +397,22 @@ func (m *JobManager) StartCrawl(ctx context.Context, req CrawlRequest) (*CrawlJo
 
 func (m *JobManager) executeAdaptiveCrawl(ctx context.Context, job *CrawlJob, pf *PriorityFrontier) {
 	defer pf.Close()
+	if job.CancelFunc != nil {
+		defer job.CancelFunc()
+	}
+
+	job.PublishEvent(ui.ProgressEvent{
+		Type:        ui.EventStart,
+		Phase:       "crawling",
+		Current:     job.PagesCrawled.Load(),
+		Total:       int64(job.Request.MaxPages),
+		QueueDepth:  job.PagesQueued.Load(),
+		TokensSaved: job.TokensSaved.Load(),
+		BytesRead:   job.BytesRead.Load(),
+		CacheHits:   job.CacheHits.Load(),
+		ErrorsCount: job.ErrorsCount.Load(),
+		Status:      "running",
+	})
 
 	// Context cancellation watcher bridge
 	go func() {
@@ -425,6 +486,19 @@ func (m *JobManager) executeAdaptiveCrawl(ctx context.Context, job *CrawlJob, pf
 			job.SetStatus("completed")
 		}
 	}
+
+	job.PublishEvent(ui.ProgressEvent{
+		Type:        ui.EventFinish,
+		Phase:       "crawling",
+		Current:     job.PagesCrawled.Load(),
+		Total:       int64(job.Request.MaxPages),
+		QueueDepth:  job.PagesQueued.Load(),
+		TokensSaved: job.TokensSaved.Load(),
+		BytesRead:   job.BytesRead.Load(),
+		CacheHits:   job.CacheHits.Load(),
+		ErrorsCount: job.ErrorsCount.Load(),
+		Status:      job.GetStatus(),
+	})
 }
 
 func (m *JobManager) processAdaptiveCrawlItem(ctx context.Context, job *CrawlJob, pf *PriorityFrontier, st *SubtreeTracker, item *PriorityItem) {
@@ -433,6 +507,20 @@ func (m *JobManager) processAdaptiveCrawlItem(ctx context.Context, job *CrawlJob
 	u, err := url.Parse(item.URL)
 	if err != nil {
 		job.AddError(fmt.Sprintf("%s: %v", item.URL, err))
+		job.PublishEvent(ui.ProgressEvent{
+			Type:        ui.EventProgress,
+			Phase:       "crawling",
+			Current:     job.PagesCrawled.Load(),
+			Total:       int64(job.Request.MaxPages),
+			QueueDepth:  job.PagesQueued.Load(),
+			TokensSaved: job.TokensSaved.Load(),
+			BytesRead:   job.BytesRead.Load(),
+			CacheHits:   job.CacheHits.Load(),
+			ErrorsCount: job.ErrorsCount.Load(),
+			Status:      "error",
+			ActiveItem:  item.URL,
+			Message:     err.Error(),
+		})
 		return
 	}
 
@@ -441,15 +529,101 @@ func (m *JobManager) processAdaptiveCrawlItem(ctx context.Context, job *CrawlJob
 		return
 	}
 
-	res, fetchErr := m.httpClient.FetchWithAuth(ctx, item.URL, job.Request.Headers, job.Request.Cookies)
+	existingDoc, _ := storage.GetCrawledDocumentByURL(ctx, item.URL)
+	opts := FetchOptions{
+		Headers: job.Request.Headers,
+		Cookies: job.Request.Cookies,
+	}
+	if existingDoc != nil && !job.Request.ForceRefresh {
+		opts.ETag = existingDoc.ETag
+		opts.LastModified = existingDoc.LastModified
+	}
+
+	res, fetchErr := m.httpClient.FetchWithAuth(ctx, item.URL, opts)
 	if fetchErr != nil {
 		job.AddError(fmt.Sprintf("%s: %v", item.URL, fetchErr))
+		job.PublishEvent(ui.ProgressEvent{
+			Type:        ui.EventProgress,
+			Phase:       "crawling",
+			Current:     job.PagesCrawled.Load(),
+			Total:       int64(job.Request.MaxPages),
+			QueueDepth:  job.PagesQueued.Load(),
+			TokensSaved: job.TokensSaved.Load(),
+			BytesRead:   job.BytesRead.Load(),
+			CacheHits:   job.CacheHits.Load(),
+			ErrorsCount: job.ErrorsCount.Load(),
+			Status:      "error",
+			ActiveItem:  item.URL,
+			Message:     fetchErr.Error(),
+		})
 		return
 	}
-	defer res.Response.Body.Close()
+
+	if res.NotModified && existingDoc != nil {
+		updatedDoc := *existingDoc
+		updatedDoc.LastCrawledAt = time.Now()
+		updatedDoc.HTTPStatus = 304
+		storage.UpsertCrawledDocument(ctx, &updatedDoc, 0)
+
+		if item.Depth < job.Request.MaxDepth {
+			for _, link := range existingDoc.OutboundLinks {
+				if enqueued, _ := pf.Enqueue(link, "", item.Depth+1); enqueued {
+					job.PagesQueued.Add(1)
+				}
+			}
+		}
+
+		job.CacheHits.Add(1)
+		job.PagesCrawled.Add(1)
+		latency := float64(time.Since(t0).Microseconds()) / 1000.0
+		job.AddResult(CrawlPageResult{
+			URL:            res.FinalURL,
+			Title:          existingDoc.Title,
+			Tokens:         existingDoc.TotalTokens,
+			RawTokens:      existingDoc.TotalTokens,
+			SavingsPct:     0,
+			Depth:          item.Depth,
+			StatusCode:     304,
+			LatencyMs:      latency,
+			DiscoveredURLs: len(existingDoc.OutboundLinks),
+		})
+		job.PublishEvent(ui.ProgressEvent{
+			Type:        ui.EventProgress,
+			Phase:       "crawling",
+			Current:     job.PagesCrawled.Load(),
+			Total:       int64(job.Request.MaxPages),
+			QueueDepth:  job.PagesQueued.Load(),
+			TokensSaved: job.TokensSaved.Load(),
+			BytesRead:   job.BytesRead.Load(),
+			CacheHits:   job.CacheHits.Load(),
+			ErrorsCount: job.ErrorsCount.Load(),
+			Status:      "cached",
+			ActiveItem:  res.FinalURL,
+		})
+		return
+	}
+	defer func() {
+		if res.Response != nil && res.Response.Body != nil {
+			res.Response.Body.Close()
+		}
+	}()
 
 	if res.Response.StatusCode >= 400 {
 		job.AddError(fmt.Sprintf("%s returned HTTP %d", item.URL, res.Response.StatusCode))
+		job.PublishEvent(ui.ProgressEvent{
+			Type:        ui.EventProgress,
+			Phase:       "crawling",
+			Current:     job.PagesCrawled.Load(),
+			Total:       int64(job.Request.MaxPages),
+			QueueDepth:  job.PagesQueued.Load(),
+			TokensSaved: job.TokensSaved.Load(),
+			BytesRead:   job.BytesRead.Load(),
+			CacheHits:   job.CacheHits.Load(),
+			ErrorsCount: job.ErrorsCount.Load(),
+			Status:      "error",
+			ActiveItem:  item.URL,
+			Message:     fmt.Sprintf("HTTP %d", res.Response.StatusCode),
+		})
 		return
 	}
 
@@ -457,13 +631,42 @@ func (m *JobManager) processAdaptiveCrawlItem(ctx context.Context, job *CrawlJob
 	htmlBytes, readErr := io.ReadAll(limitedBody)
 	if readErr != nil {
 		job.AddError(fmt.Sprintf("%s: failed to read body: %v", item.URL, readErr))
+		job.PublishEvent(ui.ProgressEvent{
+			Type:        ui.EventProgress,
+			Phase:       "crawling",
+			Current:     job.PagesCrawled.Load(),
+			Total:       int64(job.Request.MaxPages),
+			QueueDepth:  job.PagesQueued.Load(),
+			TokensSaved: job.TokensSaved.Load(),
+			BytesRead:   job.BytesRead.Load(),
+			CacheHits:   job.CacheHits.Load(),
+			ErrorsCount: job.ErrorsCount.Load(),
+			Status:      "error",
+			ActiveItem:  item.URL,
+			Message:     readErr.Error(),
+		})
 		return
 	}
+	job.BytesRead.Add(int64(len(htmlBytes)))
 
 	contentType := res.Response.Header.Get("Content-Type")
 	mdText, tokens, title, extractErr := extractor.ExtractDocumentText(res.FinalURL, contentType, htmlBytes, "clean_rag")
 	if extractErr != nil {
 		job.AddError(fmt.Sprintf("%s: extraction error: %v", item.URL, extractErr))
+		job.PublishEvent(ui.ProgressEvent{
+			Type:        ui.EventProgress,
+			Phase:       "crawling",
+			Current:     job.PagesCrawled.Load(),
+			Total:       int64(job.Request.MaxPages),
+			QueueDepth:  job.PagesQueued.Load(),
+			TokensSaved: job.TokensSaved.Load(),
+			BytesRead:   job.BytesRead.Load(),
+			CacheHits:   job.CacheHits.Load(),
+			ErrorsCount: job.ErrorsCount.Load(),
+			Status:      "error",
+			ActiveItem:  item.URL,
+			Message:     extractErr.Error(),
+		})
 		return
 	}
 
@@ -474,6 +677,86 @@ func (m *JobManager) processAdaptiveCrawlItem(ctx context.Context, job *CrawlJob
 	}
 	if savingsPct < 0 {
 		savingsPct = 0
+	}
+
+	newHashBytes := sha256.Sum256([]byte(mdText))
+	newHash := hex.EncodeToString(newHashBytes[:])
+
+	// Link discovery with anchor extraction
+	var outboundLinks []string
+	discoveredCount := 0
+	linksCount := 0
+	if strings.Contains(contentType, "html") {
+		doc, parseErr := goquery.NewDocumentFromReader(bytes.NewReader(htmlBytes))
+		if parseErr == nil {
+			doc.Find("a[href]").Each(func(_ int, s *goquery.Selection) {
+				linksCount++
+				href, exists := s.Attr("href")
+				if exists {
+					resolved := resolveRelativeURL(res.FinalURL, href)
+					if resolved != "" {
+						outboundLinks = append(outboundLinks, resolved)
+						if item.Depth < job.Request.MaxDepth {
+							anchor := strings.TrimSpace(s.Text())
+							if anchor == "" {
+								if alt, ok := s.Find("img").Attr("alt"); ok {
+									anchor = alt
+								} else if titleAttr, ok := s.Attr("title"); ok {
+									anchor = titleAttr
+								} else if aria, ok := s.Attr("aria-label"); ok {
+									anchor = aria
+								}
+							}
+							if enqueued, _ := pf.Enqueue(resolved, anchor, item.Depth+1); enqueued {
+								job.PagesQueued.Add(1)
+								discoveredCount++
+							}
+						}
+					}
+				}
+			})
+		}
+	}
+
+	if existingDoc != nil && existingDoc.ContentHash == newHash && !job.Request.ForceRefresh {
+		updatedDoc := *existingDoc
+		updatedDoc.ETag = res.ETag
+		updatedDoc.LastModified = res.LastModified
+		updatedDoc.LastCrawledAt = time.Now()
+		updatedDoc.HTTPStatus = 200
+		updatedDoc.OutboundLinks = outboundLinks
+		storage.UpsertCrawledDocument(ctx, &updatedDoc, 0)
+		
+		st.RecordYield(res.FinalURL, CleanYieldRatio(mdText, string(htmlBytes)), linksCount, item.Depth)
+
+		job.CacheHits.Add(1)
+		job.PagesCrawled.Add(1)
+		latency := float64(time.Since(t0).Microseconds()) / 1000.0
+		job.AddResult(CrawlPageResult{
+			URL:            res.FinalURL,
+			Title:          title,
+			Tokens:         tokens,
+			RawTokens:      rawTokens,
+			SavingsPct:     math.Round(savingsPct*10) / 10,
+			Depth:          item.Depth,
+			StatusCode:     200,
+			LatencyMs:      latency,
+			DiscoveredURLs: discoveredCount,
+		})
+		job.PublishEvent(ui.ProgressEvent{
+			Type:        ui.EventProgress,
+			Phase:       "crawling",
+			Current:     job.PagesCrawled.Load(),
+			Total:       int64(job.Request.MaxPages),
+			QueueDepth:  job.PagesQueued.Load(),
+			TokensSaved: job.TokensSaved.Load(),
+			BytesRead:   job.BytesRead.Load(),
+			CacheHits:   job.CacheHits.Load(),
+			ErrorsCount: job.ErrorsCount.Load(),
+			Status:      "ok",
+			ActiveItem:  res.FinalURL,
+		})
+		return
 	}
 
 	bodyForIndexing := mdText
@@ -498,37 +781,21 @@ func (m *JobManager) processAdaptiveCrawlItem(ctx context.Context, job *CrawlJob
 
 	index.GlobalEngine.IndexDocumentWithSource(res.FinalURL, docTitle, bodyForIndexing, termPositions, tokens, "crawl_job", res.FinalURL)
 
-	// Link discovery with anchor extraction
-	discoveredCount := 0
-	linksCount := 0
-	if item.Depth < job.Request.MaxDepth && strings.Contains(contentType, "html") {
-		doc, parseErr := goquery.NewDocumentFromReader(bytes.NewReader(htmlBytes))
-		if parseErr == nil {
-			doc.Find("a[href]").Each(func(_ int, s *goquery.Selection) {
-				linksCount++
-				href, exists := s.Attr("href")
-				if exists {
-					resolved := resolveRelativeURL(res.FinalURL, href)
-					if resolved != "" {
-						anchor := strings.TrimSpace(s.Text())
-						if anchor == "" {
-							if alt, ok := s.Find("img").Attr("alt"); ok {
-								anchor = alt
-							} else if title, ok := s.Attr("title"); ok {
-								anchor = title
-							} else if aria, ok := s.Attr("aria-label"); ok {
-								anchor = aria
-							}
-						}
-						if enqueued, _ := pf.Enqueue(resolved, anchor, item.Depth+1); enqueued {
-							job.PagesQueued.Add(1)
-							discoveredCount++
-						}
-					}
-				}
-			})
-		}
+	newDoc := &storage.CrawledDocument{
+		URL:           res.FinalURL,
+		Title:         title,
+		CleanBody:     bodyForIndexing,
+		TotalTokens:   tokens,
+		SourceType:    "web_crawled",
+		SourceURL:     res.FinalURL,
+		ETag:          res.ETag,
+		LastModified:  res.LastModified,
+		ContentHash:   newHash,
+		LastCrawledAt: time.Now(),
+		HTTPStatus:    res.StatusCode,
+		OutboundLinks: outboundLinks,
 	}
+	storage.UpsertCrawledDocument(ctx, newDoc, 0)
 
 	// Update adaptive subtree tracker yield
 	yieldRatio := CleanYieldRatio(mdText, string(htmlBytes))
@@ -552,10 +819,39 @@ func (m *JobManager) processAdaptiveCrawlItem(ctx context.Context, job *CrawlJob
 		LatencyMs:      latency,
 		DiscoveredURLs: discoveredCount,
 	})
+	job.PublishEvent(ui.ProgressEvent{
+		Type:        ui.EventProgress,
+		Phase:       "crawling",
+		Current:     job.PagesCrawled.Load(),
+		Total:       int64(job.Request.MaxPages),
+		QueueDepth:  job.PagesQueued.Load(),
+		TokensSaved: job.TokensSaved.Load(),
+		BytesRead:   job.BytesRead.Load(),
+		CacheHits:   job.CacheHits.Load(),
+		ErrorsCount: job.ErrorsCount.Load(),
+		Status:      "ok",
+		ActiveItem:  res.FinalURL,
+	})
 }
 
 func (m *JobManager) executeCrawl(ctx context.Context, job *CrawlJob, frontier *Frontier) {
 	defer frontier.Close()
+	if job.CancelFunc != nil {
+		defer job.CancelFunc()
+	}
+
+	job.PublishEvent(ui.ProgressEvent{
+		Type:        ui.EventStart,
+		Phase:       "crawling",
+		Current:     job.PagesCrawled.Load(),
+		Total:       int64(job.Request.MaxPages),
+		QueueDepth:  job.PagesQueued.Load(),
+		TokensSaved: job.TokensSaved.Load(),
+		BytesRead:   job.BytesRead.Load(),
+		CacheHits:   job.CacheHits.Load(),
+		ErrorsCount: job.ErrorsCount.Load(),
+		Status:      "running",
+	})
 
 	if job.Request.SitemapDiscovery {
 		sitemapURLs := DiscoverSitemaps(job.Request.URL)
@@ -620,6 +916,19 @@ func (m *JobManager) executeCrawl(ctx context.Context, job *CrawlJob, frontier *
 			job.SetStatus("completed")
 		}
 	}
+
+	job.PublishEvent(ui.ProgressEvent{
+		Type:        ui.EventFinish,
+		Phase:       "crawling",
+		Current:     job.PagesCrawled.Load(),
+		Total:       int64(job.Request.MaxPages),
+		QueueDepth:  job.PagesQueued.Load(),
+		TokensSaved: job.TokensSaved.Load(),
+		BytesRead:   job.BytesRead.Load(),
+		CacheHits:   job.CacheHits.Load(),
+		ErrorsCount: job.ErrorsCount.Load(),
+		Status:      job.GetStatus(),
+	})
 }
 
 func (m *JobManager) processCrawlItem(ctx context.Context, job *CrawlJob, frontier *Frontier, item FrontierItem) {
@@ -628,6 +937,20 @@ func (m *JobManager) processCrawlItem(ctx context.Context, job *CrawlJob, fronti
 	u, err := url.Parse(item.URL)
 	if err != nil {
 		job.AddError(fmt.Sprintf("%s: %v", item.URL, err))
+		job.PublishEvent(ui.ProgressEvent{
+			Type:        ui.EventProgress,
+			Phase:       "crawling",
+			Current:     job.PagesCrawled.Load(),
+			Total:       int64(job.Request.MaxPages),
+			QueueDepth:  job.PagesQueued.Load(),
+			TokensSaved: job.TokensSaved.Load(),
+			BytesRead:   job.BytesRead.Load(),
+			CacheHits:   job.CacheHits.Load(),
+			ErrorsCount: job.ErrorsCount.Load(),
+			Status:      "error",
+			ActiveItem:  item.URL,
+			Message:     err.Error(),
+		})
 		return
 	}
 
@@ -636,15 +959,101 @@ func (m *JobManager) processCrawlItem(ctx context.Context, job *CrawlJob, fronti
 		return
 	}
 
-	res, fetchErr := m.httpClient.FetchWithAuth(ctx, item.URL, job.Request.Headers, job.Request.Cookies)
+	existingDoc, _ := storage.GetCrawledDocumentByURL(ctx, item.URL)
+	opts := FetchOptions{
+		Headers: job.Request.Headers,
+		Cookies: job.Request.Cookies,
+	}
+	if existingDoc != nil && !job.Request.ForceRefresh {
+		opts.ETag = existingDoc.ETag
+		opts.LastModified = existingDoc.LastModified
+	}
+
+	res, fetchErr := m.httpClient.FetchWithAuth(ctx, item.URL, opts)
 	if fetchErr != nil {
 		job.AddError(fmt.Sprintf("%s: %v", item.URL, fetchErr))
+		job.PublishEvent(ui.ProgressEvent{
+			Type:        ui.EventProgress,
+			Phase:       "crawling",
+			Current:     job.PagesCrawled.Load(),
+			Total:       int64(job.Request.MaxPages),
+			QueueDepth:  job.PagesQueued.Load(),
+			TokensSaved: job.TokensSaved.Load(),
+			BytesRead:   job.BytesRead.Load(),
+			CacheHits:   job.CacheHits.Load(),
+			ErrorsCount: job.ErrorsCount.Load(),
+			Status:      "error",
+			ActiveItem:  item.URL,
+			Message:     fetchErr.Error(),
+		})
 		return
 	}
-	defer res.Response.Body.Close()
+
+	if res.NotModified && existingDoc != nil {
+		updatedDoc := *existingDoc
+		updatedDoc.LastCrawledAt = time.Now()
+		updatedDoc.HTTPStatus = 304
+		storage.UpsertCrawledDocument(ctx, &updatedDoc, 0)
+
+		if item.Depth < job.Request.MaxDepth {
+			for _, link := range existingDoc.OutboundLinks {
+				if enqueued, _ := frontier.Enqueue(link, item.Depth+1); enqueued {
+					job.PagesQueued.Add(1)
+				}
+			}
+		}
+
+		job.CacheHits.Add(1)
+		job.PagesCrawled.Add(1)
+		latency := float64(time.Since(t0).Microseconds()) / 1000.0
+		job.AddResult(CrawlPageResult{
+			URL:            res.FinalURL,
+			Title:          existingDoc.Title,
+			Tokens:         existingDoc.TotalTokens,
+			RawTokens:      existingDoc.TotalTokens,
+			SavingsPct:     0,
+			Depth:          item.Depth,
+			StatusCode:     304,
+			LatencyMs:      latency,
+			DiscoveredURLs: len(existingDoc.OutboundLinks),
+		})
+		job.PublishEvent(ui.ProgressEvent{
+			Type:        ui.EventProgress,
+			Phase:       "crawling",
+			Current:     job.PagesCrawled.Load(),
+			Total:       int64(job.Request.MaxPages),
+			QueueDepth:  job.PagesQueued.Load(),
+			TokensSaved: job.TokensSaved.Load(),
+			BytesRead:   job.BytesRead.Load(),
+			CacheHits:   job.CacheHits.Load(),
+			ErrorsCount: job.ErrorsCount.Load(),
+			Status:      "cached",
+			ActiveItem:  res.FinalURL,
+		})
+		return
+	}
+	defer func() {
+		if res.Response != nil && res.Response.Body != nil {
+			res.Response.Body.Close()
+		}
+	}()
 
 	if res.Response.StatusCode >= 400 {
 		job.AddError(fmt.Sprintf("%s returned HTTP %d", item.URL, res.Response.StatusCode))
+		job.PublishEvent(ui.ProgressEvent{
+			Type:        ui.EventProgress,
+			Phase:       "crawling",
+			Current:     job.PagesCrawled.Load(),
+			Total:       int64(job.Request.MaxPages),
+			QueueDepth:  job.PagesQueued.Load(),
+			TokensSaved: job.TokensSaved.Load(),
+			BytesRead:   job.BytesRead.Load(),
+			CacheHits:   job.CacheHits.Load(),
+			ErrorsCount: job.ErrorsCount.Load(),
+			Status:      "error",
+			ActiveItem:  item.URL,
+			Message:     fmt.Sprintf("HTTP %d", res.Response.StatusCode),
+		})
 		return
 	}
 
@@ -652,13 +1061,42 @@ func (m *JobManager) processCrawlItem(ctx context.Context, job *CrawlJob, fronti
 	htmlBytes, readErr := io.ReadAll(limitedBody)
 	if readErr != nil {
 		job.AddError(fmt.Sprintf("%s: failed to read body: %v", item.URL, readErr))
+		job.PublishEvent(ui.ProgressEvent{
+			Type:        ui.EventProgress,
+			Phase:       "crawling",
+			Current:     job.PagesCrawled.Load(),
+			Total:       int64(job.Request.MaxPages),
+			QueueDepth:  job.PagesQueued.Load(),
+			TokensSaved: job.TokensSaved.Load(),
+			BytesRead:   job.BytesRead.Load(),
+			CacheHits:   job.CacheHits.Load(),
+			ErrorsCount: job.ErrorsCount.Load(),
+			Status:      "error",
+			ActiveItem:  item.URL,
+			Message:     readErr.Error(),
+		})
 		return
 	}
+	job.BytesRead.Add(int64(len(htmlBytes)))
 
 	contentType := res.Response.Header.Get("Content-Type")
 	mdText, tokens, title, extractErr := extractor.ExtractDocumentText(res.FinalURL, contentType, htmlBytes, "clean_rag")
 	if extractErr != nil {
 		job.AddError(fmt.Sprintf("%s: extraction error: %v", item.URL, extractErr))
+		job.PublishEvent(ui.ProgressEvent{
+			Type:        ui.EventProgress,
+			Phase:       "crawling",
+			Current:     job.PagesCrawled.Load(),
+			Total:       int64(job.Request.MaxPages),
+			QueueDepth:  job.PagesQueued.Load(),
+			TokensSaved: job.TokensSaved.Load(),
+			BytesRead:   job.BytesRead.Load(),
+			CacheHits:   job.CacheHits.Load(),
+			ErrorsCount: job.ErrorsCount.Load(),
+			Status:      "error",
+			ActiveItem:  item.URL,
+			Message:     extractErr.Error(),
+		})
 		return
 	}
 
@@ -669,6 +1107,71 @@ func (m *JobManager) processCrawlItem(ctx context.Context, job *CrawlJob, fronti
 	}
 	if savingsPct < 0 {
 		savingsPct = 0
+	}
+
+	newHashBytes := sha256.Sum256([]byte(mdText))
+	newHash := hex.EncodeToString(newHashBytes[:])
+
+	var outboundLinks []string
+	discoveredCount := 0
+	if strings.Contains(contentType, "html") {
+		doc, parseErr := goquery.NewDocumentFromReader(bytes.NewReader(htmlBytes))
+		if parseErr == nil {
+			doc.Find("a[href]").Each(func(_ int, s *goquery.Selection) {
+				href, exists := s.Attr("href")
+				if exists {
+					resolved := resolveRelativeURL(res.FinalURL, href)
+					if resolved != "" {
+						outboundLinks = append(outboundLinks, resolved)
+						if item.Depth < job.Request.MaxDepth {
+							if enqueued, _ := frontier.Enqueue(resolved, item.Depth+1); enqueued {
+								job.PagesQueued.Add(1)
+								discoveredCount++
+							}
+						}
+					}
+				}
+			})
+		}
+	}
+
+	if existingDoc != nil && existingDoc.ContentHash == newHash && !job.Request.ForceRefresh {
+		updatedDoc := *existingDoc
+		updatedDoc.ETag = res.ETag
+		updatedDoc.LastModified = res.LastModified
+		updatedDoc.LastCrawledAt = time.Now()
+		updatedDoc.HTTPStatus = 200
+		updatedDoc.OutboundLinks = outboundLinks
+		storage.UpsertCrawledDocument(ctx, &updatedDoc, 0)
+		
+		job.CacheHits.Add(1)
+		job.PagesCrawled.Add(1)
+		latency := float64(time.Since(t0).Microseconds()) / 1000.0
+		job.AddResult(CrawlPageResult{
+			URL:            res.FinalURL,
+			Title:          title,
+			Tokens:         tokens,
+			RawTokens:      rawTokens,
+			SavingsPct:     math.Round(savingsPct*10) / 10,
+			Depth:          item.Depth,
+			StatusCode:     200,
+			LatencyMs:      latency,
+			DiscoveredURLs: discoveredCount,
+		})
+		job.PublishEvent(ui.ProgressEvent{
+			Type:        ui.EventProgress,
+			Phase:       "crawling",
+			Current:     job.PagesCrawled.Load(),
+			Total:       int64(job.Request.MaxPages),
+			QueueDepth:  job.PagesQueued.Load(),
+			TokensSaved: job.TokensSaved.Load(),
+			BytesRead:   job.BytesRead.Load(),
+			CacheHits:   job.CacheHits.Load(),
+			ErrorsCount: job.ErrorsCount.Load(),
+			Status:      "ok",
+			ActiveItem:  res.FinalURL,
+		})
+		return
 	}
 
 	bodyForIndexing := mdText
@@ -693,24 +1196,21 @@ func (m *JobManager) processCrawlItem(ctx context.Context, job *CrawlJob, fronti
 
 	index.GlobalEngine.IndexDocumentWithSource(res.FinalURL, docTitle, bodyForIndexing, termPositions, tokens, "crawl_job", res.FinalURL)
 
-	discoveredCount := 0
-	if item.Depth < job.Request.MaxDepth && strings.Contains(contentType, "html") {
-		doc, parseErr := goquery.NewDocumentFromReader(bytes.NewReader(htmlBytes))
-		if parseErr == nil {
-			doc.Find("a[href]").Each(func(_ int, s *goquery.Selection) {
-				href, exists := s.Attr("href")
-				if exists {
-					resolved := resolveRelativeURL(res.FinalURL, href)
-					if resolved != "" {
-						if enqueued, _ := frontier.Enqueue(resolved, item.Depth+1); enqueued {
-							job.PagesQueued.Add(1)
-							discoveredCount++
-						}
-					}
-				}
-			})
-		}
+	newDoc := &storage.CrawledDocument{
+		URL:           res.FinalURL,
+		Title:         title,
+		CleanBody:     bodyForIndexing,
+		TotalTokens:   tokens,
+		SourceType:    "web_crawled",
+		SourceURL:     res.FinalURL,
+		ETag:          res.ETag,
+		LastModified:  res.LastModified,
+		ContentHash:   newHash,
+		LastCrawledAt: time.Now(),
+		HTTPStatus:    res.StatusCode,
+		OutboundLinks: outboundLinks,
 	}
+	storage.UpsertCrawledDocument(ctx, newDoc, 0)
 
 	tokensSaved := rawTokens - tokens
 	if tokensSaved > 0 {
@@ -729,6 +1229,19 @@ func (m *JobManager) processCrawlItem(ctx context.Context, job *CrawlJob, fronti
 		StatusCode:     res.Response.StatusCode,
 		LatencyMs:      latency,
 		DiscoveredURLs: discoveredCount,
+	})
+	job.PublishEvent(ui.ProgressEvent{
+		Type:        ui.EventProgress,
+		Phase:       "crawling",
+		Current:     job.PagesCrawled.Load(),
+		Total:       int64(job.Request.MaxPages),
+		QueueDepth:  job.PagesQueued.Load(),
+		TokensSaved: job.TokensSaved.Load(),
+		BytesRead:   job.BytesRead.Load(),
+		CacheHits:   job.CacheHits.Load(),
+		ErrorsCount: job.ErrorsCount.Load(),
+		Status:      "ok",
+		ActiveItem:  res.FinalURL,
 	})
 }
 

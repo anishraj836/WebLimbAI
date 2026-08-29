@@ -116,6 +116,10 @@ func mathAbs(f float64) float64 {
 }
 
 func TestIndexDocumentIncrementalByURL(t *testing.T) {
+	originalStore := storage.GetGlobalStore()
+	defer storage.SetGlobalStore(originalStore)
+	storage.SetGlobalStore(storage.NewMemoryStore())
+
 	eng := NewEngine()
 	termPositions1 := map[string][]int{"golang": {0}}
 	eng.IndexDocument("https://golang.org", "Go Language", "Golang initial doc", termPositions1, 3)
@@ -384,6 +388,11 @@ func TestLoadFromDB_PurgeExpiredAndTrieIdempotency(t *testing.T) {
 	ctx := context.Background()
 	permURL := "https://example.com/perm-test"
 	tempURL := "https://example.com/temp-test"
+
+	// Use a fresh MemoryStore to avoid file-based state interference across tests
+	originalStore := storage.GetGlobalStore()
+	defer storage.SetGlobalStore(originalStore)
+	storage.SetGlobalStore(storage.NewMemoryStore())
 
 	// 1. Save permanent and short-lived documents
 	_ = storage.SaveCrawledDocumentWithTTL(ctx, permURL, "Permanent Doc", "Golang permanent search indexing document", 5, "test", permURL, 1*time.Hour)

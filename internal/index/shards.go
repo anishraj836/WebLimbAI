@@ -1,6 +1,9 @@
 package index
 
-import "sync"
+import (
+	"strings"
+	"sync"
+)
 
 // Metadata Sharding & Alias Resolution
 
@@ -49,10 +52,18 @@ func (e *Engine) GetDocumentMetadata(docID string) (title, url, body string, exi
 	canonicalID := e.ResolveURL(docID)
 	shard := e.getShard(canonicalID)
 	shard.mu.RLock()
-	defer shard.mu.RUnlock()
 	title, exists = shard.titles[canonicalID]
 	url = shard.urls[canonicalID]
 	body = shard.bodies[canonicalID]
+	shard.mu.RUnlock()
+
+	if body == "" && strings.Contains(canonicalID, "#chunk") {
+		baseURL := canonicalID[:strings.Index(canonicalID, "#chunk")]
+		parentShard := e.getShard(baseURL)
+		parentShard.mu.RLock()
+		body = parentShard.bodies[baseURL]
+		parentShard.mu.RUnlock()
+	}
 	return
 }
 

@@ -2,12 +2,15 @@ package mcp
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/crawler-monorepo/agent-service/api"
 	"github.com/crawler-monorepo/internal/crawler"
@@ -74,9 +77,10 @@ type CallToolResult struct {
 
 func HandleRPCMessage(raw []byte, client *crawler.Client) (respBytes []byte, err error) {
 	var reqID interface{}
+	var hasID bool
 	defer func() {
 		if r := recover(); r != nil {
-			if reqID == nil {
+			if !hasID {
 				respBytes = nil
 				err = nil
 				return
@@ -91,13 +95,8 @@ func HandleRPCMessage(raw []byte, client *crawler.Client) (respBytes []byte, err
 		}
 	}()
 
-	var rawReq struct {
-		JSONRPC string          `json:"jsonrpc"`
-		ID      interface{}     `json:"id"`
-		Method  string          `json:"method"`
-		Params  json.RawMessage `json:"params,omitempty"`
-	}
-	if err := json.Unmarshal(raw, &rawReq); err != nil {
+	var rawMap map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &rawMap); err != nil {
 		errResp := JSONRPCResponse{
 			JSONRPC: "2.0",
 			ID:      nil,
@@ -105,6 +104,16 @@ func HandleRPCMessage(raw []byte, client *crawler.Client) (respBytes []byte, err
 		}
 		return json.Marshal(errResp)
 	}
+
+	_, hasID = rawMap["id"]
+
+	var rawReq struct {
+		JSONRPC string          `json:"jsonrpc"`
+		ID      interface{}     `json:"id"`
+		Method  string          `json:"method"`
+		Params  json.RawMessage `json:"params,omitempty"`
+	}
+	_ = json.Unmarshal(raw, &rawReq)
 
 	reqID = rawReq.ID
 
@@ -117,8 +126,8 @@ func HandleRPCMessage(raw []byte, client *crawler.Client) (respBytes []byte, err
 		return json.Marshal(errResp)
 	}
 
-	// JSON-RPC 2.0: Server MUST NOT reply to a Notification (valid jsonrpc 2.0, non-empty method, and id is null/missing)
-	if rawReq.ID == nil {
+	// JSON-RPC 2.0: Server MUST NOT reply to a Notification (id key is completely omitted from the request object)
+	if !hasID {
 		return nil, nil
 	}
 
@@ -155,9 +164,10 @@ func HandleRPCMessage(raw []byte, client *crawler.Client) (respBytes []byte, err
 				InputSchema: ToolSchema{
 					Type: "object",
 					Properties: map[string]Property{
-						"url":         {Type: "string", Description: "Target website URL to scrape (e.g. https://go.dev/doc/tutorial/getting-started)"},
-						"mode":        {Type: "string", Description: "Extraction mode: 'clean_rag' (strips navbars/scripts/ads, default), 'preserve_links', or 'raw'", Enum: []string{"clean_rag", "preserve_links", "raw"}},
-						"ttl_seconds": {Type: "integer", Description: "Optional time-to-live for caching the scraped document in seconds"},
+						"url":           {Type: "string", Description: "Target website URL to scrape (e.g. https://go.dev/doc/tutorial/getting-started)"},
+						"mode":          {Type: "string", Description: "Extraction mode: 'clean_rag' (strips navbars/scripts/ads, default), 'preserve_links', or 'raw'", Enum: []string{"clean_rag", "preserve_links", "raw"}},
+						"ttl_seconds":   {Type: "integer", Description: "Optional time-to-live for caching the scraped document in seconds"},
+						"force_refresh": {Type: "boolean", Description: "Force refresh existing crawled documents"},
 					},
 					Required: []string{"url"},
 				},
@@ -218,13 +228,48 @@ func HandleRPCMessage(raw []byte, client *crawler.Client) (respBytes []byte, err
 			if client == nil {
 				client = crawler.NewClient()
 			}
-			res, err := client.Fetch(ctx, targetURL)
-			if err != nil || res == nil || res.Response == nil {
+
+			forceRefresh := false
+			if val, ok := params.Arguments["force_refresh"]; ok && val != nil {
+				if b, ok := val.(bool); ok {
+					forceRefresh = b
+				}
+			}
+
+			opts := crawler.FetchOptions{}
+			if !forceRefresh {
+				if doc, err := storage.GetCrawledDocumentByURL(ctx, targetURL); err == nil && doc != nil {
+					opts.ETag = doc.ETag
+					opts.LastModified = doc.LastModified
+				}
+			}
+
+			res, err := client.FetchWithAuth(ctx, targetURL, opts)
+			if err != nil || res == nil {
 				toolResult = CallToolResult{IsError: true, Content: []ToolContent{{Type: "text", Text: fmt.Sprintf("Scrape failed: %v", err)}}}
 				break
 			}
 
+			if res.NotModified {
+				if doc, _ := storage.GetCrawledDocumentByURL(ctx, targetURL); doc != nil {
+					toolResult = CallToolResult{
+						Content: []ToolContent{
+							{Type: "text", Text: fmt.Sprintf("Successfully scraped and indexed %s\nTitle: %s\n\nContent:\n%s", doc.URL, doc.Title, doc.CleanBody)},
+						},
+					}
+					break
+				}
+			}
+
+			if res.Response == nil {
+				toolResult = CallToolResult{IsError: true, Content: []ToolContent{{Type: "text", Text: "Scrape failed: no response"}}}
+				break
+			}
+
 			if res.Response.StatusCode != 200 {
+				if res.Response.Body != nil {
+					res.Response.Body.Close()
+				}
 				toolResult = CallToolResult{
 					IsError: true,
 					Content: []ToolContent{
@@ -293,29 +338,23 @@ func HandleRPCMessage(raw []byte, client *crawler.Client) (respBytes []byte, err
 				break
 			}
 
-			ttlDuration, hasTTL := api.ClampTTL(ttlSeconds)
-			if hasTTL {
-				_ = storage.SaveCrawledDocumentWithTTL(
-					context.Background(),
-					res.FinalURL,
-					title,
-					markdownContent,
-					totalTokens,
-					"mcp_scraped",
-					targetURL,
-					ttlDuration,
-				)
-			} else {
-				_ = storage.SaveCrawledDocument(
-					context.Background(),
-					res.FinalURL,
-					title,
-					markdownContent,
-					totalTokens,
-					"mcp_scraped",
-					targetURL,
-				)
+			hashBytes := sha256.Sum256([]byte(markdownContent))
+			contentHash := hex.EncodeToString(hashBytes[:])
+			doc := &storage.CrawledDocument{
+				URL:           res.FinalURL,
+				Title:         title,
+				CleanBody:     markdownContent,
+				TotalTokens:   totalTokens,
+				SourceType:    "mcp_scraped",
+				SourceURL:     targetURL,
+				ETag:          res.ETag,
+				LastModified:  res.LastModified,
+				ContentHash:   contentHash,
+				LastCrawledAt: time.Now(),
+				HTTPStatus:    res.Response.StatusCode,
 			}
+			ttlDuration, _ := api.ClampTTL(ttlSeconds)
+			_ = storage.UpsertCrawledDocument(context.Background(), doc, ttlDuration)
 			if res.FinalURL != targetURL {
 				index.GlobalEngine.AddAlias(targetURL, res.FinalURL)
 				_ = storage.SaveURLAlias(context.Background(), targetURL, res.FinalURL)
@@ -430,10 +469,6 @@ func HandleRPCMessage(raw []byte, client *crawler.Client) (respBytes []byte, err
 		return json.Marshal(resp)
 
 	default:
-		// Ignore notifications or unknown methods
-		if req.ID == nil {
-			return nil, nil
-		}
 		resp := JSONRPCResponse{
 			JSONRPC: "2.0",
 			ID:      req.ID,

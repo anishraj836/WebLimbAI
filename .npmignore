@@ -1,0 +1,49 @@
+# Go and project source files
+*.go
+go.mod
+go.sum
+.goreleaser.yaml
+Caddyfile
+docker-compose.yml
+Dockerfile
+Makefile
+smithery.yaml
+openapi.json
+
+# Internal source trees & services
+agent-service/
+indexer-service/
+search-service/
+internal/
+cmd/
+common/
+config/
+mcp-server/
+
+# Git & CI/CD
+.git/
+.github/
+.agents/
+.DS_Store
+
+# Logs, Databases & Data files
+data/
+*.db
+*.db-*
+*.log
+scratch/
+dist/
+test/
+
+# Environment files
+.env
+.env.*
+*.env
+
+# Local binary builds
+agent-limbs-mcp
+agentlimbs
+agentlimbs-light
+lightlimbs
+weblimb
+weblimb.exe

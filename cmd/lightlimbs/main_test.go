@@ -600,4 +600,123 @@ func TestClusterServer_Integration(t *testing.T) {
 	}
 }
 
+func TestCrawlJobStreamHandler_CompletedJob(t *testing.T) {
+	tmpDir := t.TempDir()
+	server := NewEmbeddedServer(tmpDir)
+	router := server.SetupRouter()
+
+	// Start a synchronous mock crawl job that completes immediately
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Write([]byte(`<html><body><h1>Stream Done</h1></body></html>`))
+	}))
+	defer ts.Close()
+
+	req := crawler.CrawlRequest{
+		URL:           ts.URL,
+		MaxDepth:      1,
+		MaxPages:      1,
+		AllowLoopback: true,
+	}
+	job, err := server.jobManager.StartCrawl(context.Background(), req)
+	if err != nil {
+		t.Fatalf("failed to start crawl: %v", err)
+	}
+
+	// Verify job is completed
+	if job.GetStatus() != "completed" {
+		t.Fatalf("expected job status 'completed', got: %s", job.GetStatus())
+	}
+
+	// Query stream endpoint
+	streamReq, _ := http.NewRequest("GET", "/v1/crawl/"+job.ID+"/stream", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, streamReq)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected HTTP 200 for SSE stream, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	body := rec.Body.String()
+	if !strings.Contains(body, "event: finish") {
+		t.Fatalf("expected 'event: finish' in stream response for completed job, got: %s", body)
+	}
+}
+
+func TestCrawlJobStreamHandler_ActiveJob(t *testing.T) {
+	tmpDir := t.TempDir()
+	server := NewEmbeddedServer(tmpDir)
+	router := server.SetupRouter()
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Write([]byte(`<html><body><h1>Active Stream</h1></body></html>`))
+	}))
+	defer ts.Close()
+
+	req := crawler.CrawlRequest{
+		URL:           ts.URL,
+		MaxDepth:      1,
+		MaxPages:      5,
+		Async:         true,
+		AllowLoopback: true,
+	}
+	job, err := server.jobManager.StartCrawl(context.Background(), req)
+	if err != nil {
+		t.Fatalf("failed to start async crawl: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	streamReq, _ := http.NewRequestWithContext(ctx, "GET", "/v1/crawl/"+job.ID+"/stream", nil)
+	rec := httptest.NewRecorder()
+
+	go func() {
+		// Cancel context after short delay to terminate stream loop
+		cancel()
+	}()
+
+	router.ServeHTTP(rec, streamReq)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected HTTP 200 for SSE stream, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	body := rec.Body.String()
+	if !strings.Contains(body, "event: start") && !strings.Contains(body, "event: finish") {
+		t.Fatalf("expected SSE events in response, got: %s", body)
+	}
+}
+
+func TestCLISubcommands_ProgressFlags(t *testing.T) {
+	os.Setenv("ENV", "test")
+	defer os.Unsetenv("ENV")
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Write([]byte(`<html><body><h1>Flags Test</h1><p>Test page</p></body></html>`))
+	}))
+	defer ts.Close()
+
+	tmpDir := t.TempDir()
+	client := crawler.NewTestClient(true)
+
+	// 1. Test crawl with --no-progress and --quiet
+	runCrawlWithClient(client, []string{ts.URL + "/", "--max-pages", "1", "--no-progress", "--quiet", "--data-dir", tmpDir})
+
+	// 2. Test scrape with --no-progress and --quiet
+	runScrapeWithClient(client, []string{ts.URL + "/", "--no-progress", "--quiet", "--data-dir", tmpDir})
+
+	// 3. Test seed with --no-progress, --limit, and --quiet
+	runSeed([]string{"--limit", "2", "--no-progress", "--quiet", "--data-dir", tmpDir})
+
+	// 4. Test index with --no-progress and --quiet
+	dummyDir := filepath.Join(tmpDir, "index_test")
+	_ = os.MkdirAll(dummyDir, 0755)
+	_ = os.WriteFile(filepath.Join(dummyDir, "test.md"), []byte("# Hello Markdown"), 0644)
+	runIndex([]string{dummyDir, "--no-progress", "--quiet", "--data-dir", tmpDir})
+}
+
+
 

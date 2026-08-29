@@ -176,6 +176,52 @@ func (p *PostgresStore) Save(ctx context.Context, doc *CrawledDocument, ttl time
 	return err
 }
 
+func (p *PostgresStore) UpsertDocument(ctx context.Context, doc *CrawledDocument, ttl time.Duration) error {
+	if p.pool == nil {
+		return fmt.Errorf("postgres pool is nil")
+	}
+	if doc == nil || doc.URL == "" {
+		return fmt.Errorf("cannot upsert nil or empty URL document")
+	}
+
+	sourceType := doc.SourceType
+	if sourceType == "" {
+		sourceType = "web_crawled"
+	}
+	sourceURL := doc.SourceURL
+	if sourceURL == "" {
+		sourceURL = doc.URL
+	}
+
+	var expiresAt *time.Time
+	if ttl > 0 {
+		exp := time.Now().Add(ttl)
+		expiresAt = &exp
+	} else if doc.ExpiresAt != nil {
+		expiresAt = doc.ExpiresAt
+	}
+
+	query := `
+	INSERT INTO crawled_pages (url, title, clean_body, total_tokens, source_type, source_url, expires_at, etag, last_modified, content_hash, last_crawled_at, http_status, outbound_links)
+	VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+	ON CONFLICT (url) DO UPDATE SET
+		title = EXCLUDED.title,
+		clean_body = EXCLUDED.clean_body,
+		total_tokens = EXCLUDED.total_tokens,
+		source_type = EXCLUDED.source_type,
+		source_url = EXCLUDED.source_url,
+		expires_at = EXCLUDED.expires_at,
+		etag = EXCLUDED.etag,
+		last_modified = EXCLUDED.last_modified,
+		content_hash = EXCLUDED.content_hash,
+		last_crawled_at = EXCLUDED.last_crawled_at,
+		http_status = EXCLUDED.http_status,
+		outbound_links = EXCLUDED.outbound_links;
+	`
+	_, err := p.pool.Exec(ctx, query, doc.URL, doc.Title, doc.CleanBody, doc.TotalTokens, sourceType, sourceURL, expiresAt, doc.ETag, doc.LastModified, doc.ContentHash, doc.LastCrawledAt, doc.HTTPStatus, doc.OutboundLinks)
+	return err
+}
+
 func (p *PostgresStore) GetByURL(ctx context.Context, targetURL string) (*CrawledDocument, error) {
 	if p.pool == nil {
 		return nil, fmt.Errorf("postgres pool is nil")
@@ -187,7 +233,7 @@ func (p *PostgresStore) GetByURL(ctx context.Context, targetURL string) (*Crawle
 	canonicalURL := p.GetAlias(ctx, targetURL)
 
 	query := `
-	SELECT id, url, title, clean_body, total_tokens, COALESCE(source_type, 'web_crawled'), COALESCE(source_url, url), expires_at
+	SELECT id, url, title, clean_body, total_tokens, COALESCE(source_type, 'web_crawled'), COALESCE(source_url, url), expires_at, etag, last_modified, content_hash, last_crawled_at, http_status, outbound_links
 	FROM crawled_pages
 	WHERE (url = $1 OR url = $2 OR source_url = $1 OR source_url = $2)
 	  AND (expires_at IS NULL OR expires_at > NOW())
@@ -196,7 +242,7 @@ func (p *PostgresStore) GetByURL(ctx context.Context, targetURL string) (*Crawle
 	`
 	row := p.pool.QueryRow(ctx, query, targetURL, canonicalURL)
 	var doc CrawledDocument
-	err := row.Scan(&doc.ID, &doc.URL, &doc.Title, &doc.CleanBody, &doc.TotalTokens, &doc.SourceType, &doc.SourceURL, &doc.ExpiresAt)
+	err := row.Scan(&doc.ID, &doc.URL, &doc.Title, &doc.CleanBody, &doc.TotalTokens, &doc.SourceType, &doc.SourceURL, &doc.ExpiresAt, &doc.ETag, &doc.LastModified, &doc.ContentHash, &doc.LastCrawledAt, &doc.HTTPStatus, &doc.OutboundLinks)
 	if err != nil {
 		return nil, nil
 	}
@@ -209,7 +255,7 @@ func (p *PostgresStore) List(ctx context.Context, limit, offset int) ([]CrawledD
 	}
 
 	query := `
-	SELECT id, url, title, clean_body, total_tokens, COALESCE(source_type, 'web_crawled'), COALESCE(source_url, url), expires_at
+	SELECT id, url, title, clean_body, total_tokens, COALESCE(source_type, 'web_crawled'), COALESCE(source_url, url), expires_at, etag, last_modified, content_hash, last_crawled_at, http_status, outbound_links
 	FROM crawled_pages
 	WHERE expires_at IS NULL OR expires_at > NOW()
 	ORDER BY id ASC
@@ -230,7 +276,7 @@ func (p *PostgresStore) List(ctx context.Context, limit, offset int) ([]CrawledD
 	var docs []CrawledDocument
 	for rows.Next() {
 		var doc CrawledDocument
-		if err := rows.Scan(&doc.ID, &doc.URL, &doc.Title, &doc.CleanBody, &doc.TotalTokens, &doc.SourceType, &doc.SourceURL, &doc.ExpiresAt); err == nil {
+		if err := rows.Scan(&doc.ID, &doc.URL, &doc.Title, &doc.CleanBody, &doc.TotalTokens, &doc.SourceType, &doc.SourceURL, &doc.ExpiresAt, &doc.ETag, &doc.LastModified, &doc.ContentHash, &doc.LastCrawledAt, &doc.HTTPStatus, &doc.OutboundLinks); err == nil {
 			docs = append(docs, doc)
 		}
 	}

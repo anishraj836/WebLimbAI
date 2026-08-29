@@ -1,0 +1,51 @@
+{
+  "name": "weblimbai",
+  "version": "1.5.0-entropy",
+  "description": "WebLimbAI & LightLimbs: High-performance RAG Web Crawler, Vector Store & MCP Server CLI",
+  "main": "bin/weblimbai.js",
+  "bin": {
+    "weblimbai": "./bin/weblimbai.js",
+    "lightlimbs": "./bin/lightlimbs.js",
+    "weblimb": "./bin/weblimbai.js"
+  },
+  "scripts": {
+    "test": "node --test test/npm_wrapper.test.js",
+    "build:binaries": "bash scripts/build_npm_binaries.sh",
+    "lint": "node -c bin/weblimbai.js bin/lightlimbs.js bin/lib/*.js test/*.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/anishraj836/WebLimbAI.git"
+  },
+  "keywords": [
+    "crawler",
+    "rag",
+    "mcp",
+    "model-context-protocol",
+    "vector-search",
+    "bm25",
+    "claude",
+    "cursor",
+    "cli",
+    "scraper",
+    "llm",
+    "lightlimbs",
+    "weblimb"
+  ],
+  "author": "Anish Raj <anishraj836@gmail.com>",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/anishraj836/WebLimbAI/issues"
+  },
+  "homepage": "https://github.com/anishraj836/WebLimbAI#readme",
+  "files": [
+    "bin/",
+    "scripts/install.sh",
+    "scripts/install.ps1",
+    "README.md",
+    "LICENSE"
+  ]
+}

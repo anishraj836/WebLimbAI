@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -35,16 +37,20 @@ import (
 	"github.com/crawler-monorepo/internal/cluster"
 	"github.com/crawler-monorepo/internal/crawler"
 	"github.com/crawler-monorepo/internal/extractor"
+	"github.com/crawler-monorepo/internal/chunker"
 	"github.com/crawler-monorepo/internal/index"
 	"github.com/crawler-monorepo/internal/mcp"
 	"github.com/crawler-monorepo/internal/search"
 	"github.com/crawler-monorepo/internal/storage"
+	"github.com/crawler-monorepo/internal/ui"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"go.uber.org/zap"
 )
 
 var (
+	chunkWindow int = 512
+	chunkOverlap int = 64
 	version         = "v1.5.0-entropy"
 	saveTriggerChan = make(chan string, 100)
 	saveTriggerOnce sync.Once
@@ -576,6 +582,109 @@ func (s *EmbeddedServer) CancelCrawlJobHandler(w http.ResponseWriter, r *http.Re
 	})
 }
 
+func (s *EmbeddedServer) CrawlJobStreamHandler(w http.ResponseWriter, r *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, `{"error":"Streaming not supported"}`, http.StatusBadRequest)
+		return
+	}
+
+	jobID := chi.URLParam(r, "id")
+	if jobID == "" {
+		jobID = chi.URLParam(r, "job_id")
+	}
+	if jobID == "" {
+		jobID = r.URL.Query().Get("job_id")
+	}
+
+	job, found := s.jobManager.GetJob(jobID)
+	if !found || job == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "Crawl job not found"})
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache, no-transform")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	status := job.GetStatus()
+
+	// If job is already completed/failed/cancelled, emit finish and return immediately
+	if status != "running" {
+		finalEv := ui.ProgressEvent{
+			Timestamp:   time.Now(),
+			JobID:       job.ID,
+			Type:        ui.EventFinish,
+			Phase:       "crawling",
+			Current:     job.PagesCrawled.Load(),
+			Total:       int64(job.Request.MaxPages),
+			QueueDepth:  job.PagesQueued.Load(),
+			TokensSaved: job.TokensSaved.Load(),
+			BytesRead:   job.BytesRead.Load(),
+			CacheHits:   job.CacheHits.Load(),
+			ErrorsCount: job.ErrorsCount.Load(),
+			Status:      status,
+		}
+		data, _ := json.Marshal(finalEv)
+		fmt.Fprintf(w, "event: finish\ndata: %s\n\n", data)
+		flusher.Flush()
+		return
+	}
+
+	events := job.SubscribeEvents()
+	defer job.UnsubscribeEvents(events)
+
+	// Send initial start snapshot
+	initialEv := ui.ProgressEvent{
+		Timestamp:   time.Now(),
+		JobID:       job.ID,
+		Type:        ui.EventStart,
+		Phase:       "crawling",
+		Current:     job.PagesCrawled.Load(),
+		Total:       int64(job.Request.MaxPages),
+		QueueDepth:  job.PagesQueued.Load(),
+		TokensSaved: job.TokensSaved.Load(),
+		BytesRead:   job.BytesRead.Load(),
+		CacheHits:   job.CacheHits.Load(),
+		ErrorsCount: job.ErrorsCount.Load(),
+		Status:      status,
+	}
+	data, _ := json.Marshal(initialEv)
+	fmt.Fprintf(w, "event: start\ndata: %s\n\n", data)
+	flusher.Flush()
+
+	heartbeat := time.NewTicker(15 * time.Second)
+	defer heartbeat.Stop()
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-heartbeat.C:
+			fmt.Fprint(w, ": ping\n\n")
+			flusher.Flush()
+		case ev, ok := <-events:
+			if !ok {
+				return
+			}
+			evBytes, err := json.Marshal(ev)
+			if err != nil {
+				continue
+			}
+			fmt.Fprintf(w, "event: %s\ndata: %s\n\n", ev.Type, evBytes)
+			flusher.Flush()
+
+			if ev.Type == ui.EventFinish {
+				return
+			}
+		}
+	}
+}
+
 func (s *EmbeddedServer) SchemaExtractHandler(w http.ResponseWriter, r *http.Request) {
 	var req extractor.SchemaExtractRequest
 	r.Body = http.MaxBytesReader(w, r.Body, 10*1024*1024)
@@ -701,6 +810,10 @@ func (s *EmbeddedServer) SetupRouter() http.Handler {
 		// Stage 2 endpoints
 		r.Post("/v1/crawl", s.CrawlHandler)
 		r.Get("/v1/crawl/{id}", s.GetCrawlJobHandler)
+		r.Get("/v1/crawl/{id}/stream", s.CrawlJobStreamHandler)
+		r.Get("/v1/crawl/stream", s.CrawlJobStreamHandler)
+		r.Get("/api/v1/crawl/stream", s.CrawlJobStreamHandler)
+		r.Get("/api/v1/crawl/{id}/stream", s.CrawlJobStreamHandler)
 		r.Delete("/v1/crawl/{id}", s.CancelCrawlJobHandler)
 		r.Post("/v1/extract/schema", s.SchemaExtractHandler)
 	})
@@ -718,6 +831,59 @@ func GetJanitorInterval() time.Duration {
 		}
 	}
 	return 15 * time.Minute
+}
+
+func setupStorage(dataDir, dbType, sqlitePath string) {
+	if dataDir == "" {
+		dataDir = "data"
+	}
+	_ = os.MkdirAll(dataDir, 0755)
+
+	if dbType == "" {
+		dbType = os.Getenv("DATABASE_DRIVER")
+		if dbType == "" {
+			if os.Getenv("DATABASE_URL") != "" {
+				dbURL := os.Getenv("DATABASE_URL")
+				if strings.HasPrefix(dbURL, "postgres://") || strings.HasPrefix(dbURL, "postgresql://") {
+					dbType = "postgres"
+				} else {
+					dbType = "sqlite"
+				}
+			} else {
+				dbType = "sqlite"
+			}
+		}
+	}
+
+	switch strings.ToLower(strings.TrimSpace(dbType)) {
+	case "sqlite", "sqlite3", "db":
+		path := sqlitePath
+		if path == "" {
+			if dbURL := os.Getenv("DATABASE_URL"); dbURL != "" && (strings.HasPrefix(dbURL, "sqlite://") || strings.HasSuffix(dbURL, ".db") || strings.HasPrefix(dbURL, "file:")) {
+				path = dbURL
+			} else {
+				path = filepath.Join(dataDir, "docs.db")
+			}
+		}
+		if s, err := storage.NewSQLiteStore(path); err == nil {
+			storage.SetGlobalStore(s)
+		} else {
+			storage.SetGlobalStore(storage.NewFileStore(""))
+		}
+	case "file", "json", "local":
+		storage.SetGlobalStore(storage.NewFileStore(filepath.Join(dataDir, "crawled_pages.json")))
+	case "memory", "mem":
+		storage.SetGlobalStore(storage.NewMemoryStore())
+	case "postgres", "postgresql", "pg":
+		dbURL := os.Getenv("DATABASE_URL")
+		if s, err := storage.NewPostgresStore(dbURL); err == nil {
+			storage.SetGlobalStore(s)
+		} else {
+			storage.SetGlobalStore(storage.NewFileStore(""))
+		}
+	default:
+		storage.SetGlobalStore(storage.NewStoreFromEnv())
+	}
 }
 
 func initStorage(ctx context.Context, dataDir string) {
@@ -745,7 +911,7 @@ func initStorage(ctx context.Context, dataDir string) {
 		for _, d := range docs {
 			index.GlobalEngine.IndexDocumentDirectly(d.URL, d.Title, d.CleanBody, d.TotalTokens, d.SourceURL)
 		}
-		logger.Log.Info(fmt.Sprintf("Hydrated %d documents into memory from file fallback", len(docs)))
+		logger.Log.Info(fmt.Sprintf("Hydrated %d documents into memory from storage (%s)", len(docs), storage.GetGlobalStore().DriverName()))
 	}
 
 	if ctx == nil {
@@ -765,6 +931,8 @@ func saveStorage(dataDir string) {
 
 	vectorPath := filepath.Join(dataDir, "vector_index.json")
 	_ = index.GlobalEngine.GetVectorIndex().SaveSnapshot(vectorPath)
+
+	_ = storage.GetGlobalStore().Close()
 }
 
 func loadSnapshotsForCLI(dataDir string) {
@@ -858,15 +1026,28 @@ func runServe(args []string) {
 	fs.StringVar(port, "p", "", "HTTP port to bind (shorthand)")
 	dataDir := fs.String("data-dir", "", "Data directory for snapshots (default 'data' or DATA_DIR env)")
 	fs.StringVar(dataDir, "d", "", "Data directory (shorthand)")
+	chunkWindowFlag := fs.Int("chunk-window", 512, "Max tokens per chunk")
+	chunkOverlapFlag := fs.Int("chunk-overlap", 64, "Overlap tokens between chunks")
 	mcpMode := fs.Bool("mcp", false, "Start in stdio MCP server mode")
 	_ = fs.Bool("readonly", false, "Start in readonly mode")
 	clusterPeers := fs.String("cluster-peers", "", "Comma-separated peer URLs/hosts for distributed cluster")
 	nodeID := fs.String("node-id", "", "Cluster node ID (default 'node-<port>')")
 	shards := fs.Int("shards", 16, "Number of cluster partition shards (default 16)")
+	dbType := fs.String("db-type", "sqlite", "Storage driver (sqlite, file, postgres, memory)")
+	sqlitePath := fs.String("sqlite-path", "", "Path to SQLite database file (default: <data-dir>/docs.db)")
 
 	if err := fs.Parse(args); err != nil {
 		os.Exit(1)
 	}
+
+	cOpts := chunker.DefaultChunkingOptions()
+	if *chunkWindowFlag > 0 {
+		cOpts.MaxTokens = *chunkWindowFlag
+	}
+	if *chunkOverlapFlag > 0 {
+		cOpts.Overlap = *chunkOverlapFlag
+	}
+	index.WithChunkingOptions(cOpts)(index.GlobalEngine)
 
 	if *port == "" {
 		*port = os.Getenv("PORT")
@@ -895,6 +1076,7 @@ func runServe(args []string) {
 	rootCtx, rootCancel := context.WithCancel(context.Background())
 	defer rootCancel()
 
+	setupStorage(*dataDir, *dbType, *sqlitePath)
 	initStorage(rootCtx, *dataDir)
 
 	server := NewEmbeddedServer(*dataDir)
@@ -1124,6 +1306,12 @@ func runScrapeWithClient(client *crawler.Client, args []string) {
 	noIndex := fs.Bool("no-index", false, "Do not index into local vector/BM25 database")
 	dataDir := fs.String("data-dir", "data", "Snapshot data directory")
 	fs.StringVar(dataDir, "d", "data", "Snapshot data directory (shorthand)")
+	forceRefresh := fs.Bool("force-refresh", false, "Force refresh existing crawled documents")
+	dbType := fs.String("db-type", "sqlite", "Storage driver (sqlite, file, postgres, memory)")
+	sqlitePath := fs.String("sqlite-path", "", "Path to SQLite database file (default: <data-dir>/docs.db)")
+	noProgress := fs.Bool("no-progress", false, "Disable progress spinner")
+	quiet := fs.Bool("quiet", false, "Quiet mode")
+	fs.BoolVar(quiet, "q", false, "Quiet mode (shorthand)")
 
 	posArgs, err := parseInterleavedFlags(fs, args)
 	if err != nil {
@@ -1140,6 +1328,10 @@ func runScrapeWithClient(client *crawler.Client, args []string) {
 		fmt.Fprintln(os.Stderr, "      --ttl <seconds>     Time-to-live in seconds [default: 604800 / 7 days]")
 		fmt.Fprintln(os.Stderr, "      --no-index          Skip persisting to local search index")
 		fmt.Fprintln(os.Stderr, "  -d, --data-dir <dir>    Snapshot storage directory [default: data]")
+		fmt.Fprintln(os.Stderr, "      --db-type <type>    Storage backend (sqlite, file, postgres, memory) [default: sqlite]")
+		fmt.Fprintln(os.Stderr, "      --sqlite-path <path>Path to SQLite database file [default: <data-dir>/docs.db]")
+		fmt.Fprintln(os.Stderr, "      --no-progress       Disable progress spinner")
+		fmt.Fprintln(os.Stderr, "  -q, --quiet             Quiet mode (suppress logs)")
 		os.Exit(1)
 	}
 
@@ -1150,37 +1342,94 @@ func runScrapeWithClient(client *crawler.Client, args []string) {
 		os.Exit(1)
 	}
 
+	setupStorage(*dataDir, *dbType, *sqlitePath)
+
+	startTime := time.Now()
+	fetchURL := utils.TransformGitHubURL(normURL)
+
+	var sp *ui.Spinner
+	if ui.ShouldUseInteractiveUI(os.Stderr, *noProgress, *quiet) && !*jsonOut {
+		sp = ui.NewSpinner(os.Stderr, fmt.Sprintf("Fetching and extracting clean RAG Markdown for %s...", fetchURL))
+		sp.Start()
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	fetchURL := utils.TransformGitHubURL(normURL)
 	if client == nil {
 		allowLoopback := os.Getenv("ENV") == "test" || os.Getenv("AGENTLIMBS_ALLOW_LOOPBACK") == "1"
 		client = crawler.NewTestClient(allowLoopback)
 	}
-	res, err := client.Fetch(ctx, fetchURL)
+
+	opts := crawler.FetchOptions{}
+	if !*forceRefresh {
+		if doc, err := storage.GetCrawledDocumentByURL(ctx, fetchURL); err == nil && doc != nil {
+			opts.ETag = doc.ETag
+			opts.LastModified = doc.LastModified
+		}
+	}
+	res, err := client.FetchWithAuth(ctx, fetchURL, opts)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: Failed to fetch %s: %v\n", fetchURL, err)
+		if sp != nil {
+			sp.Error(fmt.Sprintf("Failed to fetch %s: %v", fetchURL, err))
+		} else {
+			fmt.Fprintf(os.Stderr, "Error: Failed to fetch %s: %v\n", fetchURL, err)
+		}
 		os.Exit(1)
+	}
+	if res.NotModified {
+		doc, _ := storage.GetCrawledDocumentByURL(ctx, fetchURL)
+		if doc != nil {
+			if sp != nil {
+				sp.Success(fmt.Sprintf("Cached 304 Not Modified for %s", fetchURL))
+			}
+			if *jsonOut {
+				payload := ScrapeCLIOutput{
+					URL:        res.FinalURL,
+					Title:      doc.Title,
+					Markdown:   doc.CleanBody,
+					Tokens:     doc.TotalTokens,
+					RawTokens:  doc.TotalTokens,
+					SavingsPct: 0,
+				}
+				jsonBytes, _ := json.MarshalIndent(payload, "", "  ")
+				fmt.Println(string(jsonBytes))
+			} else if *outFile == "" {
+				fmt.Println(doc.CleanBody)
+			}
+			os.Exit(0)
+		}
 	}
 	defer res.Response.Body.Close()
 
 	if res.Response.StatusCode != 200 {
-		fmt.Fprintf(os.Stderr, "Error: HTTP %d (%s) returned by %s\n", res.Response.StatusCode, res.Response.Status, res.FinalURL)
+		if sp != nil {
+			sp.Error(fmt.Sprintf("HTTP %d (%s) returned by %s", res.Response.StatusCode, res.Response.Status, res.FinalURL))
+		} else {
+			fmt.Fprintf(os.Stderr, "Error: HTTP %d (%s) returned by %s\n", res.Response.StatusCode, res.Response.Status, res.FinalURL)
+		}
 		os.Exit(1)
 	}
 
 	limitedBody := io.LimitReader(res.Response.Body, 10*1024*1024)
 	htmlBytes, err := io.ReadAll(limitedBody)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: Failed to read response body: %v\n", err)
+		if sp != nil {
+			sp.Error(fmt.Sprintf("Failed to read response body: %v", err))
+		} else {
+			fmt.Fprintf(os.Stderr, "Error: Failed to read response body: %v\n", err)
+		}
 		os.Exit(1)
 	}
 
 	contentType := res.Response.Header.Get("Content-Type")
 	mdText, tokens, title, extractErr := extractor.ExtractDocumentText(res.FinalURL, contentType, htmlBytes, *mode)
 	if extractErr != nil {
-		fmt.Fprintf(os.Stderr, "Error: Extraction failed: %v\n", extractErr)
+		if sp != nil {
+			sp.Error(fmt.Sprintf("Extraction failed: %v", extractErr))
+		} else {
+			fmt.Fprintf(os.Stderr, "Error: Extraction failed: %v\n", extractErr)
+		}
 		os.Exit(1)
 	}
 
@@ -1218,30 +1467,29 @@ func runScrapeWithClient(client *crawler.Client, args []string) {
 
 		index.GlobalEngine.IndexDocumentWithSource(res.FinalURL, docTitle, bodyForIndexing, termPositions, tokens, "cli_scraped", res.FinalURL)
 
-		if ttlDuration, hasTTL := api.ClampTTL(*ttl); hasTTL {
-			_ = storage.SaveCrawledDocumentWithTTL(
-				context.Background(),
-				res.FinalURL,
-				docTitle,
-				bodyForIndexing,
-				tokens,
-				"cli_scraped",
-				res.FinalURL,
-				ttlDuration,
-			)
-		} else {
-			_ = storage.SaveCrawledDocument(
-				context.Background(),
-				res.FinalURL,
-				docTitle,
-				bodyForIndexing,
-				tokens,
-				"cli_scraped",
-				res.FinalURL,
-			)
+		hashBytes := sha256.Sum256([]byte(bodyForIndexing))
+		contentHash := hex.EncodeToString(hashBytes[:])
+		doc := &storage.CrawledDocument{
+			URL:           res.FinalURL,
+			Title:         docTitle,
+			CleanBody:     bodyForIndexing,
+			TotalTokens:   tokens,
+			SourceType:    "cli_scraped",
+			SourceURL:     res.FinalURL,
+			ETag:          res.ETag,
+			LastModified:  res.LastModified,
+			ContentHash:   contentHash,
+			LastCrawledAt: time.Now(),
+			HTTPStatus:    res.Response.StatusCode,
 		}
+		ttlDuration, _ := api.ClampTTL(*ttl)
+		_ = storage.UpsertCrawledDocument(context.Background(), doc, ttlDuration)
 
 		saveStorage(*dataDir)
+	}
+
+	if sp != nil {
+		sp.Success(fmt.Sprintf("Extracted %s tokens (%.1f%% savings) from %s in %s", ui.FormatNumber(int64(tokens)), savingsPct, res.FinalURL, ui.FormatDuration(time.Since(startTime))))
 	}
 
 	if *outFile != "" {
@@ -1249,7 +1497,9 @@ func runScrapeWithClient(client *crawler.Client, args []string) {
 			fmt.Fprintf(os.Stderr, "Error: Failed to write to %s: %v\n", *outFile, err)
 			os.Exit(1)
 		}
-		fmt.Fprintf(os.Stderr, "Extracted markdown saved to %s\n", *outFile)
+		if !*quiet {
+			fmt.Fprintf(os.Stderr, "Extracted markdown saved to %s\n", *outFile)
+		}
 	}
 
 	if *jsonOut {
@@ -1280,6 +1530,8 @@ func runSearch(args []string) {
 	jsonOut := fs.Bool("json", false, "Output results as raw JSON array")
 	fs.BoolVar(jsonOut, "j", false, "Output results as raw JSON array (shorthand)")
 	snippetLen := fs.Int("snippet-len", 180, "Highlight snippet length")
+	dbType := fs.String("db-type", "sqlite", "Storage driver (sqlite, file, postgres, memory)")
+	sqlitePath := fs.String("sqlite-path", "", "Path to SQLite database file (default: <data-dir>/docs.db)")
 
 	posArgs, err := parseInterleavedFlags(fs, args)
 	if err != nil {
@@ -1295,8 +1547,12 @@ func runSearch(args []string) {
 		fmt.Fprintln(os.Stderr, "  -j, --json              Output results as JSON array")
 		fmt.Fprintln(os.Stderr, "  -d, --data-dir <dir>    Snapshot storage directory [default: data]")
 		fmt.Fprintln(os.Stderr, "      --snippet-len <num> Snippet highlight length [default: 180]")
+		fmt.Fprintln(os.Stderr, "      --db-type <type>    Storage backend (sqlite, file, postgres, memory) [default: sqlite]")
+		fmt.Fprintln(os.Stderr, "      --sqlite-path <path>Path to SQLite database file [default: <data-dir>/docs.db]")
 		os.Exit(1)
 	}
+
+	setupStorage(*dataDir, *dbType, *sqlitePath)
 
 	query := strings.Join(posArgs, " ")
 	loadSnapshotsForCLI(*dataDir)
@@ -1465,17 +1721,20 @@ func runSeed(args []string) {
 	fs.StringVar(dataDir, "d", "data", "Snapshot data directory (shorthand)")
 	quiet := fs.Bool("quiet", false, "Suppress progress output")
 	fs.BoolVar(quiet, "q", false, "Quiet mode (shorthand)")
+	noProgress := fs.Bool("no-progress", false, "Disable progress bar")
+	jsonOut := fs.Bool("json", false, "Output JSON summary")
+	fs.BoolVar(jsonOut, "j", false, "Output JSON summary (shorthand)")
 
 	limit := fs.Int("limit", 0, "Limit number of seeded documents (0 for all)")
 	fs.IntVar(limit, "l", 0, "Limit number of seeded documents (shorthand)")
+	dbType := fs.String("db-type", "sqlite", "Storage driver (sqlite, file, postgres, memory)")
+	sqlitePath := fs.String("sqlite-path", "", "Path to SQLite database file (default: <data-dir>/docs.db)")
 
 	if err := fs.Parse(args); err != nil {
 		os.Exit(1)
 	}
 
-	if !*quiet {
-		fmt.Fprintln(os.Stderr, "Seeding SDE technical corpus into local index...")
-	}
+	setupStorage(*dataDir, *dbType, *sqlitePath)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
@@ -1642,6 +1901,31 @@ func runSeed(args []string) {
 		},
 	}
 
+	totalExpected := 0
+	for _, domain := range domains {
+		totalExpected += len(domain.Topics) * 5
+	}
+	if *limit > 0 && *limit < totalExpected {
+		totalExpected = *limit
+	}
+
+	var prog *ui.CompositeProgress
+	if ui.ShouldUseInteractiveUI(os.Stdout, *noProgress, *quiet) && !*jsonOut {
+		prog = ui.NewCompositeProgress(ui.ProgressConfig{
+			Writer:         os.Stdout,
+			Title:          "Seeding SDE Technical Corpus",
+			Total:          int64(totalExpected),
+			RefreshRate:    50 * time.Millisecond,
+			ShowSpeed:      true,
+			ShowETA:        true,
+			ShowTokens:     true,
+			ShowActiveItem: true,
+			EnableColors:   true,
+		})
+		prog.SetPhase("seeding")
+		prog.Start()
+	}
+
 	totalIngested := 0
 	startTime := time.Now()
 
@@ -1673,12 +1957,37 @@ func runSeed(args []string) {
 
 				_ = storage.SaveCrawledDocument(ctx, url, title, cleanBody, totalTokens, "sde_corpus", url)
 				index.GlobalEngine.IndexDocumentDirectly(url, title, cleanBody, totalTokens)
+
+				if prog != nil {
+					prog.Increment()
+					prog.AddTokensSaved(int64(totalTokens))
+					prog.SetActiveItem(topic)
+				}
 			}
 		}
 	}
 
+	if prog != nil {
+		prog.Stop()
+	}
+
 	saveStorage(*dataDir)
 	duration := time.Since(startTime)
+
+	if *jsonOut {
+		totalDocs, avgLen, vocabSize := index.GlobalEngine.GetInvertedIndex().GetStats()
+		resMap := map[string]interface{}{
+			"documents_seeded": totalIngested,
+			"duration_seconds": duration.Seconds(),
+			"total_docs":       totalDocs,
+			"avg_doc_len":      avgLen,
+			"vocab_size":       vocabSize,
+			"data_dir":         *dataDir,
+		}
+		jsonBytes, _ := json.MarshalIndent(resMap, "", "  ")
+		fmt.Println(string(jsonBytes))
+		return
+	}
 
 	if !*quiet {
 		totalDocs, avgLen, vocabSize := index.GlobalEngine.GetInvertedIndex().GetStats()
@@ -1766,6 +2075,12 @@ func runCrawlWithClient(client *crawler.Client, args []string) {
 	fs.BoolVar(adaptive, "a", false, "Adaptive crawl (shorthand)")
 	minPriority := fs.Float64("min-priority", 0.10, "Minimum entropy priority threshold for adaptive crawl")
 	dataDir := fs.String("data-dir", "data", "Snapshot data directory")
+	forceRefresh := fs.Bool("force-refresh", false, "Force refresh existing crawled documents")
+	dbType := fs.String("db-type", "sqlite", "Storage driver (sqlite, file, postgres, memory)")
+	sqlitePath := fs.String("sqlite-path", "", "Path to SQLite database file (default: <data-dir>/docs.db)")
+	noProgress := fs.Bool("no-progress", false, "Disable live progress rendering")
+	quiet := fs.Bool("quiet", false, "Quiet mode")
+	fs.BoolVar(quiet, "q", false, "Quiet mode (shorthand)")
 
 	posArgs, err := parseInterleavedFlags(fs, args)
 	if err != nil {
@@ -1792,6 +2107,7 @@ func runCrawlWithClient(client *crawler.Client, args []string) {
 		client = crawler.NewTestClient(allowLoopback)
 	}
 
+	setupStorage(*dataDir, *dbType, *sqlitePath)
 	loadSnapshotsForCLI(*dataDir)
 	jm := crawler.NewJobManager(client, *dataDir)
 	defer jm.Close()
@@ -1810,16 +2126,64 @@ func runCrawlWithClient(client *crawler.Client, args []string) {
 		AllowLoopback:    allowLoopback,
 		Adaptive:         *adaptive,
 		MinPriority:      *minPriority,
+		ForceRefresh:     *forceRefresh,
 	}
 
+	var prog *ui.CompositeProgress
+	var nonTTY *ui.NonTTYReporter
+
+	if !*asyncMode && !*jsonOut {
+		if ui.ShouldUseInteractiveUI(os.Stdout, *noProgress, *quiet) {
+			prog = ui.NewCompositeProgress(ui.ProgressConfig{
+				Writer:         os.Stdout,
+				Title:          fmt.Sprintf("WebLimbAI Crawl (%s)", seedURL),
+				Total:          int64(*maxPages),
+				RefreshRate:    50 * time.Millisecond,
+				ShowSpeed:      true,
+				ShowETA:        true,
+				ShowQueue:      true,
+				ShowTokens:     true,
+				ShowBytes:      true,
+				ShowActiveItem: true,
+				EnableColors:   true,
+			})
+			prog.SetPhase("crawling")
+			prog.Start()
+		} else if !*quiet && !*noProgress {
+			nonTTY = ui.NewNonTTYReporter(os.Stderr, 3*time.Second)
+		}
+	}
+
+	startTime := time.Now()
 	job, err := jm.StartCrawl(context.Background(), req)
 	if err != nil {
+		if prog != nil {
+			prog.Stop()
+		}
 		fmt.Fprintf(os.Stderr, "Error starting crawl: %v\n", err)
 		os.Exit(1)
 	}
 
+	if prog != nil || nonTTY != nil {
+		events := job.SubscribeEvents()
+		go func() {
+			for ev := range events {
+				if prog != nil {
+					prog.Send(ev)
+				}
+				if nonTTY != nil {
+					nonTTY.OnEvent(ev)
+				}
+			}
+		}()
+	}
+
 	if !*asyncMode {
 		saveStorage(*dataDir)
+	}
+
+	if prog != nil {
+		prog.Stop()
 	}
 
 	if *jsonOut {
@@ -1828,12 +2192,35 @@ func runCrawlWithClient(client *crawler.Client, args []string) {
 		return
 	}
 
-	fmt.Printf("Crawl Job %s finished with status: %s\n", job.ID, job.GetStatus())
-	fmt.Printf("   - Pages Crawled: %d\n", job.PagesCrawled.Load())
-	fmt.Printf("   - Pages Queued:  %d\n", job.PagesQueued.Load())
-	fmt.Printf("   - Tokens Saved:  %d\n", job.TokensSaved.Load())
-	if job.ErrorsCount.Load() > 0 {
-		fmt.Printf("   - Errors:        %d\n", job.ErrorsCount.Load())
+	if *asyncMode {
+		fmt.Printf("Crawl job %s started in background.\n", job.ID)
+		return
+	}
+
+	if !*quiet {
+		crawled := job.PagesCrawled.Load()
+		cached := job.CacheHits.Load()
+		okFetched := crawled - cached
+		if okFetched < 0 {
+			okFetched = 0
+		}
+		duration := time.Since(startTime)
+		dbPath := *sqlitePath
+		if dbPath == "" {
+			dbPath = filepath.Join(*dataDir, "docs.db")
+		}
+
+		fmt.Println("\n+-------------------------------------------------------------------------------+")
+		fmt.Printf("|                       WebLimbAI Crawl Complete (Job %s)                   |\n", ui.TruncateMiddle(job.ID, 12, "..."))
+		fmt.Println("+-------------------------------------------------------------------------------+")
+		fmt.Printf("|  • Pages Crawled:       %d total (%d fetched 200 OK, %d cached 304)\n", crawled, okFetched, cached)
+		fmt.Printf("|  • Total Queued:        %d discovered links\n", job.PagesQueued.Load())
+		fmt.Printf("|  • Raw Data Read:       %s\n", ui.FormatBytes(job.BytesRead.Load()))
+		fmt.Printf("|  • Token Savings:       %s tokens\n", ui.FormatNumber(job.TokensSaved.Load()))
+		fmt.Printf("|  • Wall Time:           %s\n", ui.FormatDuration(duration))
+		fmt.Printf("|  • Errors Encountered:  %d errors\n", job.ErrorsCount.Load())
+		fmt.Printf("|  • Snapshot DB:         %s\n", dbPath)
+		fmt.Println("+-------------------------------------------------------------------------------+")
 	}
 }
 
@@ -1979,10 +2366,140 @@ func main() {
 		runSearch(subcommandArgs)
 	case "init-mcp":
 		runInitMCP(subcommandArgs)
+	case "index":
+		runIndex(subcommandArgs)
 	case "seed":
 		runSeed(subcommandArgs)
 	default:
 		fmt.Fprintf(os.Stderr, "Error: Unknown subcommand %q\nRun 'lightlimbs --help' for usage.\n", firstArg)
 		os.Exit(1)
+	}
+}
+func runIndex(args []string) {
+	fs := flag.NewFlagSet("index", flag.ExitOnError)
+	includeStr := fs.String("include", "", "Comma-separated glob patterns to include")
+	excludeStr := fs.String("exclude", "", "Comma-separated glob patterns to exclude")
+	maxSizeMB := fs.Int64("max-size", 10, "Max file size in MB")
+	dryRun := fs.Bool("dry-run", false, "Dry run, do not index")
+	noIndex := fs.Bool("no-index", false, "Only process files, do not write to index")
+	dataDir := fs.String("data-dir", "data", "Data directory")
+	fs.StringVar(dataDir, "d", "data", "Data directory (shorthand)")
+	dbType := fs.String("db-type", "sqlite", "Storage driver (sqlite, file, postgres, memory)")
+	sqlitePath := fs.String("sqlite-path", "", "Path to SQLite database file (default: <data-dir>/docs.db)")
+	noProgress := fs.Bool("no-progress", false, "Disable progress bar")
+	quiet := fs.Bool("quiet", false, "Quiet mode")
+	fs.BoolVar(quiet, "q", false, "Quiet mode (shorthand)")
+	jsonOut := fs.Bool("json", false, "Output JSON summary")
+	fs.BoolVar(jsonOut, "j", false, "Output JSON (shorthand)")
+
+	fs.Parse(args)
+	if fs.NArg() < 1 {
+		fmt.Fprintf(os.Stderr, "Usage: lightlimbs index <path> [flags]\n")
+		os.Exit(1)
+	}
+
+	path := fs.Arg(0)
+
+	var includes, excludes []string
+	if *includeStr != "" {
+		includes = strings.Split(*includeStr, ",")
+	}
+	if *excludeStr != "" {
+		excludes = strings.Split(*excludeStr, ",")
+	}
+
+	broadcaster := ui.NewEventBroadcaster(512)
+	defer broadcaster.Close()
+
+	cfg := crawler.LocalIndexerConfig{
+		BasePath:        path,
+		MaxFileSize:     *maxSizeMB * 1024 * 1024,
+		IncludePatterns: includes,
+		ExcludePatterns: excludes,
+		DryRun:          *dryRun,
+		NoIndex:         *noIndex,
+		Broadcaster:     broadcaster,
+	}
+
+	setupStorage(*dataDir, *dbType, *sqlitePath)
+	loadSnapshotsForCLI(*dataDir)
+
+	var prog *ui.CompositeProgress
+	var nonTTY *ui.NonTTYReporter
+
+	if !*jsonOut {
+		if ui.ShouldUseInteractiveUI(os.Stdout, *noProgress, *quiet) {
+			prog = ui.NewCompositeProgress(ui.ProgressConfig{
+				Writer:         os.Stdout,
+				Title:          fmt.Sprintf("Indexing %s", path),
+				Total:          0, // indeterminate initially
+				RefreshRate:    50 * time.Millisecond,
+				ShowSpeed:      true,
+				ShowActiveItem: true,
+				EnableColors:   true,
+			})
+			prog.SetPhase("indexing")
+			prog.Start()
+		} else if !*quiet && !*noProgress {
+			nonTTY = ui.NewNonTTYReporter(os.Stderr, 3*time.Second)
+		}
+	}
+
+	if prog != nil || nonTTY != nil {
+		events := broadcaster.Subscribe()
+		go func() {
+			for ev := range events {
+				if prog != nil {
+					prog.Send(ev)
+				}
+				if nonTTY != nil {
+					nonTTY.OnEvent(ev)
+				}
+			}
+		}()
+	}
+
+	start := time.Now()
+	res, err := crawler.IndexDirectory(context.Background(), cfg, index.GlobalEngine, storage.GetGlobalStore())
+	if err != nil {
+		if prog != nil {
+			prog.Stop()
+		}
+		fmt.Fprintf(os.Stderr, "Error indexing directory: %v\n", err)
+		os.Exit(1)
+	}
+
+	if prog != nil {
+		prog.Stop()
+	}
+
+	if !*dryRun && !*noIndex {
+		saveStorage(*dataDir)
+	}
+
+	duration := time.Since(start)
+
+	if *jsonOut {
+		resMap := map[string]interface{}{
+			"path":             path,
+			"duration_seconds": duration.Seconds(),
+			"files_processed":  res.FilesProcessed,
+			"files_indexed":    res.FilesIndexed,
+			"files_skipped":    res.FilesSkipped,
+			"files_deleted":    res.FilesDeleted,
+			"errors":           res.Errors,
+		}
+		jsonBytes, _ := json.MarshalIndent(resMap, "", "  ")
+		fmt.Println(string(jsonBytes))
+		return
+	}
+
+	if !*quiet {
+		fmt.Printf("Finished in %v\n", duration)
+		fmt.Printf("Files Processed: %d\n", res.FilesProcessed)
+		fmt.Printf("Files Indexed:   %d\n", res.FilesIndexed)
+		fmt.Printf("Files Skipped:   %d\n", res.FilesSkipped)
+		fmt.Printf("Files Deleted:   %d\n", res.FilesDeleted)
+		fmt.Printf("Errors:          %d\n", res.Errors)
 	}
 }

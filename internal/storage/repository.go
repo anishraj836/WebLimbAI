@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -23,18 +24,42 @@ var (
 )
 
 // InitDB initializes the database and updates the global store.
-// If databaseURL is provided, it connects to PostgreSQL; otherwise it initializes file-fallback storage.
+// If databaseURL is provided, it connects to PostgreSQL or SQLite; otherwise it initializes SQLite/File fallback.
 func InitDB(databaseURL string) {
 	repoMu.Lock()
 	defer repoMu.Unlock()
 
 	if databaseURL == "" {
+		driver := os.Getenv("DATABASE_DRIVER")
+		if driver == "" || strings.EqualFold(driver, "sqlite") || strings.EqualFold(driver, "sqlite3") {
+			sqliteStore, err := NewSQLiteStore("data/docs.db")
+			if err == nil {
+				Pool = nil
+				SetGlobalStore(sqliteStore)
+				return
+			}
+		}
 		log.Printf("[Storage] No database URL provided; operating in file-fallback mode")
 		Pool = nil
 		SetGlobalStore(NewFileStore(""))
 		return
 	}
 
+	// Detect SQLite DSNs
+	if strings.HasPrefix(databaseURL, "sqlite://") || strings.HasSuffix(databaseURL, ".db") || strings.HasPrefix(databaseURL, "file:") {
+		sqliteStore, err := NewSQLiteStore(databaseURL)
+		if err == nil && sqliteStore != nil {
+			Pool = nil
+			SetGlobalStore(sqliteStore)
+			return
+		}
+		log.Printf("[Storage] SQLite initialization failed: %v; operating in file-fallback mode", err)
+		Pool = nil
+		SetGlobalStore(NewFileStore(""))
+		return
+	}
+
+	// PostgreSQL
 	pgStore, err := NewPostgresStore(databaseURL)
 	if err != nil || pgStore == nil {
 		log.Printf("[Storage] PostgreSQL initialization failed: %v; operating in file-fallback mode", err)
@@ -80,7 +105,13 @@ func InitTables(ctx context.Context) error {
 		created_at TIMESTAMPTZ DEFAULT NOW(),
 		expires_at TIMESTAMPTZ
 	);
-	CREATE INDEX IF NOT EXISTS idx_crawled_pages_url ON crawled_pages(url);
+	ALTER TABLE crawled_pages ADD COLUMN IF NOT EXISTS etag TEXT DEFAULT '';
+	ALTER TABLE crawled_pages ADD COLUMN IF NOT EXISTS last_modified TEXT DEFAULT '';
+	ALTER TABLE crawled_pages ADD COLUMN IF NOT EXISTS content_hash TEXT DEFAULT '';
+	ALTER TABLE crawled_pages ADD COLUMN IF NOT EXISTS last_crawled_at TIMESTAMPTZ DEFAULT NOW();
+	ALTER TABLE crawled_pages ADD COLUMN IF NOT EXISTS http_status INT DEFAULT 0;
+	ALTER TABLE crawled_pages ADD COLUMN IF NOT EXISTS outbound_links JSONB DEFAULT '[]'::jsonb;
+	CREATE UNIQUE INDEX IF NOT EXISTS idx_crawled_pages_url ON crawled_pages(url);
 	CREATE INDEX IF NOT EXISTS idx_crawled_pages_expires_at ON crawled_pages(expires_at);
 	`
 	_, err := p.Exec(ctx, query)
@@ -103,6 +134,11 @@ func SaveCrawledDocumentWithTTL(ctx context.Context, url, title, cleanBody strin
 		SourceURL:   sourceURL,
 	}
 	return GetGlobalStore().Save(ctx, doc, ttl)
+}
+
+// UpsertCrawledDocument inserts or updates a document.
+func UpsertCrawledDocument(ctx context.Context, doc *CrawledDocument, ttl time.Duration) error {
+	return GetGlobalStore().UpsertDocument(ctx, doc, ttl)
 }
 
 // GetCrawledDocuments returns all active stored documents.
@@ -150,6 +186,43 @@ func CloseDB() {
 			_ = store.Close()
 		}
 	}
+}
+
+// DeleteCrawledDocument deletes a document by URL or source URL.
+func DeleteCrawledDocument(ctx context.Context, url string) error {
+	store := GetGlobalStore()
+	if sq, ok := store.(*SQLiteStore); ok {
+		return sq.DeleteCrawledDocument(ctx, url)
+	}
+	return nil
+}
+
+// GetOutboundLinks returns outbound links for a URL.
+func GetOutboundLinks(ctx context.Context, url string) ([]string, error) {
+	doc, err := GetCrawledDocumentByURL(ctx, url)
+	if err != nil || doc == nil {
+		return nil, err
+	}
+	return doc.OutboundLinks, nil
+}
+
+// GetDocumentMetadataBySource retrieves documents matching sourceType.
+func GetDocumentMetadataBySource(ctx context.Context, sourceType string, limit, offset int) ([]CrawledDocument, error) {
+	store := GetGlobalStore()
+	if sq, ok := store.(*SQLiteStore); ok {
+		return sq.GetDocumentMetadataBySource(ctx, sourceType, limit, offset)
+	}
+	return store.List(ctx, limit, offset)
+}
+
+// GetDocumentsCount returns total active document count.
+func GetDocumentsCount(ctx context.Context) (int64, error) {
+	store := GetGlobalStore()
+	if sq, ok := store.(*SQLiteStore); ok {
+		return sq.GetDocumentsCount(ctx)
+	}
+	docs, err := store.List(ctx, 0, 0)
+	return int64(len(docs)), err
 }
 
 // LocalStorage manages raw HTML gzip file persistence.

@@ -42,7 +42,7 @@ func TestAuthRedirectSecurity_SameOriginPreservation(t *testing.T) {
 		"session_id": "sess_98765",
 	}
 
-	res, err := client.FetchWithAuth(context.Background(), server.URL+"/start", headers, cookies)
+	res, err := client.FetchWithAuth(context.Background(), server.URL+"/start", FetchOptions{Headers: headers, Cookies: cookies})
 	if err != nil {
 		t.Fatalf("FetchWithAuth failed: %v", err)
 	}
@@ -93,7 +93,7 @@ func TestAuthRedirectSecurity_CrossOriginStripping(t *testing.T) {
 		"auth_sess": "val_12345",
 	}
 
-	res, err := client.FetchWithAuth(context.Background(), startServer.URL+"/redirect", headers, cookies)
+	res, err := client.FetchWithAuth(context.Background(), startServer.URL+"/redirect", FetchOptions{Headers: headers, Cookies: cookies})
 	if err != nil {
 		t.Fatalf("FetchWithAuth cross-origin redirect failed: %v", err)
 	}

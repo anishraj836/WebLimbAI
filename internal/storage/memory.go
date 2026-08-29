@@ -105,6 +105,68 @@ func (m *MemoryStore) Save(ctx context.Context, doc *CrawledDocument, ttl time.D
 	return nil
 }
 
+func (m *MemoryStore) UpsertDocument(ctx context.Context, doc *CrawledDocument, ttl time.Duration) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if doc == nil || doc.URL == "" {
+		return fmt.Errorf("cannot upsert nil or empty URL document")
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	var expiresAt *time.Time
+	if ttl != 0 {
+		exp := time.Now().Add(ttl)
+		expiresAt = &exp
+	} else if doc.ExpiresAt != nil {
+		expiresAt = doc.ExpiresAt
+	}
+
+	sourceType := doc.SourceType
+	if sourceType == "" {
+		sourceType = "web_crawled"
+	}
+	sourceURL := doc.SourceURL
+	if sourceURL == "" {
+		sourceURL = doc.URL
+	}
+
+	existing, exists := m.docs[doc.URL]
+	docID := m.nextID
+	createdAt := time.Now()
+	if exists {
+		docID = existing.ID
+		if !existing.CreatedAt.IsZero() {
+			createdAt = existing.CreatedAt
+		}
+	} else {
+		m.nextID++
+		m.docList = append(m.docList, doc.URL)
+	}
+
+	m.docs[doc.URL] = CrawledDocument{
+		ID:            docID,
+		URL:           doc.URL,
+		Title:         doc.Title,
+		CleanBody:     doc.CleanBody,
+		TotalTokens:   doc.TotalTokens,
+		SourceType:    sourceType,
+		SourceURL:     sourceURL,
+		CreatedAt:     createdAt,
+		ExpiresAt:     expiresAt,
+		ETag:          doc.ETag,
+		LastModified:  doc.LastModified,
+		ContentHash:   doc.ContentHash,
+		LastCrawledAt: doc.LastCrawledAt,
+		HTTPStatus:    doc.HTTPStatus,
+		OutboundLinks: doc.OutboundLinks,
+	}
+
+	return nil
+}
+
 func (m *MemoryStore) GetByURL(ctx context.Context, targetURL string) (*CrawledDocument, error) {
 	if ctx.Err() != nil {
 		return nil, ctx.Err()

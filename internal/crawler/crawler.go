@@ -1,6 +1,7 @@
 package crawler
 
 import (
+	"io"
 	"context"
 	"fmt"
 	"net"
@@ -54,7 +55,7 @@ func IsSameOrigin(orig, dest OriginTuple) bool {
 // FetchWithAuth performs an authenticated HTTP fetch with strict (scheme, FQDN, port) origin matching.
 // If redirected across origins, subdomains, or to HTTP cleartext, caller-supplied headers, auth tokens,
 // and cookies are immediately stripped.
-func (c *Client) FetchWithAuth(ctx context.Context, targetURL string, headers map[string]string, cookies map[string]string) (*FetchResult, error) {
+func (c *Client) FetchWithAuth(ctx context.Context, targetURL string, opts FetchOptions) (*FetchResult, error) {
 	if IsMediaResourceURL(targetURL) {
 		return nil, fmt.Errorf("blocked media resource URL: %s", targetURL)
 	}
@@ -66,7 +67,7 @@ func (c *Client) FetchWithAuth(ctx context.Context, targetURL string, headers ma
 	initialOrigin := GetOriginTuple(seedParsed)
 
 	callerHeaderKeys := make(map[string]bool)
-	for k := range headers {
+	for k := range opts.Headers {
 		callerHeaderKeys[strings.ToLower(k)] = true
 	}
 
@@ -130,17 +131,25 @@ func (c *Client) FetchWithAuth(ctx context.Context, targetURL string, headers ma
 	ApplyAntiBotHeaders(req, profile)
 
 	// Apply caller-supplied custom headers
-	for k, v := range headers {
+	for k, v := range opts.Headers {
 		req.Header.Set(k, v)
 	}
 
 	// Apply caller-supplied cookies
-	if len(cookies) > 0 {
+	if len(opts.Cookies) > 0 {
 		var cookieParts []string
-		for k, v := range cookies {
+		for k, v := range opts.Cookies {
 			cookieParts = append(cookieParts, fmt.Sprintf("%s=%s", k, v))
 		}
 		req.Header.Set("Cookie", strings.Join(cookieParts, "; "))
+	}
+
+	// Inject conditional caching headers
+	if opts.ETag != "" {
+		req.Header.Set("If-None-Match", opts.ETag)
+	}
+	if opts.LastModified != "" {
+		req.Header.Set("If-Modified-Since", opts.LastModified)
 	}
 
 	if reqID, ok := ctx.Value(middleware.RequestIDKey).(string); ok && reqID != "" {
@@ -160,8 +169,22 @@ func (c *Client) FetchWithAuth(ctx context.Context, targetURL string, headers ma
 		finalURL = resp.Request.URL.String()
 	}
 
-	return &FetchResult{
-		Response: resp,
-		FinalURL: finalURL,
-	}, nil
+	res := &FetchResult{
+		Response:     resp,
+		FinalURL:     finalURL,
+		StatusCode:   resp.StatusCode,
+		ETag:         resp.Header.Get("ETag"),
+		LastModified: resp.Header.Get("Last-Modified"),
+	}
+
+	if resp.StatusCode == http.StatusNotModified {
+		res.NotModified = true
+		if resp.Body != nil {
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}
+		return res, nil
+	}
+
+	return res, nil
 }

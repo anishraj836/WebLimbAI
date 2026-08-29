@@ -11,7 +11,6 @@ import (
 	"os"
 	"os/exec"
 	"sync"
-	"syscall"
 )
 
 // HeadlessRenderer defines the interface for dynamic client-side JS rendering engines.
@@ -105,13 +104,7 @@ func (e *FallbackRenderEngine) RenderSPA(ctx context.Context, targetURL string) 
 			if err == nil {
 				chromeAttempted = true
 				cmd := exec.CommandContext(ctx, path, "--headless", "--disable-gpu", "--dump-dom", "--no-sandbox", targetURL)
-				cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-				cmd.Cancel = func() error {
-					if cmd.Process != nil && cmd.Process.Pid > 0 {
-						return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-					}
-					return nil
-				}
+				configureProcessGroup(cmd)
 				var stderrBuf bytes.Buffer
 				cmd.Stderr = &stderrBuf
 				output, err := cmd.Output()

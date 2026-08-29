@@ -544,8 +544,20 @@ type Client struct {
 
 // FetchResult contains the HTTP response and final resolved URL from a fetch.
 type FetchResult struct {
-	Response *http.Response
-	FinalURL string
+	Response     *http.Response
+	FinalURL     string
+	ETag         string
+	LastModified string
+	StatusCode   int
+	NotModified  bool
+}
+
+// FetchOptions provides advanced configurations for a fetch request.
+type FetchOptions struct {
+	Headers      map[string]string
+	Cookies      map[string]string
+	ETag         string
+	LastModified string
 }
 
 func NewClient() *Client {

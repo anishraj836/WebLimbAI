@@ -40,6 +40,11 @@ func GetGlobalStore() DocumentStore {
 // NewStore creates a DocumentStore for the given driver name and connection string/path.
 func NewStore(driver, dsn string) (DocumentStore, error) {
 	switch strings.ToLower(strings.TrimSpace(driver)) {
+	case "sqlite", "sqlite3", "sqlite-pure", "docs.db", "db":
+		if dsn == "" {
+			dsn = "data/docs.db"
+		}
+		return NewSQLiteStore(dsn)
 	case "postgres", "postgresql", "pg":
 		if dsn == "" {
 			return nil, fmt.Errorf("postgres driver requires a non-empty connection DSN")
@@ -50,13 +55,14 @@ func NewStore(driver, dsn string) (DocumentStore, error) {
 	case "memory", "mem":
 		return NewMemoryStore(), nil
 	default:
-		return nil, fmt.Errorf("unsupported storage driver: %q (supported: postgres, file, memory)", driver)
+		return nil, fmt.Errorf("unsupported storage driver: %q (supported: sqlite, postgres, file, memory)", driver)
 	}
 }
 
 // NewStoreFromEnv automatically initializes a DocumentStore using environment variables.
 // If DATABASE_URL starts with postgres://, it attempts to connect to PostgreSQL.
-// If connection fails or DATABASE_URL is empty, it automatically falls back to FileStore.
+// If DATABASE_URL starts with sqlite:// or ends in .db, it initializes SQLite.
+// If connection fails or DATABASE_URL is empty, it attempts SQLite before falling back to FileStore.
 func NewStoreFromEnv() DocumentStore {
 	driver := os.Getenv("DATABASE_DRIVER")
 	dbURL := os.Getenv("DATABASE_URL")
@@ -66,16 +72,42 @@ func NewStoreFromEnv() DocumentStore {
 		if err == nil && store != nil {
 			return store
 		}
-		log.Printf("[Storage] Failed to initialize driver %q: %v; falling back to file storage", driver, err)
+		log.Printf("[Storage] Failed to initialize driver %q: %v; falling back to sqlite/file storage", driver, err)
 	}
 
-	if dbURL != "" && (strings.HasPrefix(dbURL, "postgres://") || strings.HasPrefix(dbURL, "postgresql://")) {
-		store, err := NewPostgresStore(dbURL)
-		if err == nil && store != nil {
-			return store
+	if dbURL != "" {
+		if strings.HasPrefix(dbURL, "sqlite://") || strings.HasSuffix(dbURL, ".db") || strings.HasPrefix(dbURL, "file:") {
+			store, err := NewSQLiteStore(dbURL)
+			if err == nil && store != nil {
+				return store
+			}
+			log.Printf("[Storage] SQLite connection failed: %v; falling back to file storage", err)
 		}
-		log.Printf("[Storage] PostgreSQL connection failed: %v; falling back to file storage", err)
+		if strings.HasPrefix(dbURL, "postgres://") || strings.HasPrefix(dbURL, "postgresql://") {
+			store, err := NewPostgresStore(dbURL)
+			if err == nil && store != nil {
+				return store
+			}
+			log.Printf("[Storage] PostgreSQL connection failed: %v; falling back to file storage", err)
+		}
+	}
+
+	// Default embedded engine is SQLiteStore (falling back to FileStore if directory not writable)
+	sqliteStore, err := NewSQLiteStore("data/docs.db")
+	if err == nil && sqliteStore != nil {
+		return sqliteStore
 	}
 
 	return NewFileStore("")
 }
+
+// InitGlobalStore initializes and sets the process-wide active DocumentStore for driver and dsn.
+func InitGlobalStore(driver, dsn string) error {
+	store, err := NewStore(driver, dsn)
+	if err != nil {
+		return err
+	}
+	SetGlobalStore(store)
+	return nil
+}
+
