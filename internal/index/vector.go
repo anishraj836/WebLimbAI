@@ -121,6 +121,8 @@ type VectorIndex struct {
 	i8Vectors  map[string]QuantizedVector
 }
 
+var _ VectorStore = (*VectorIndex)(nil)
+
 func NewVectorIndex(dimensions int) *VectorIndex {
 	return NewVectorIndexWithPrecision(dimensions, PrecisionFloat32)
 }
