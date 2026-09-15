@@ -293,6 +293,7 @@ console.log("Telemetry initialized for doc page v1.5");
 	t.Logf("Clean Markdown Bytes  : %d bytes", len(cleanMarkdown))
 	t.Logf("Clean Markdown Tokens : %d tokens", cleanTokens)
 	t.Logf("Token Reduction       : %.2f%%", reductionPct)
+	t.Logf("\n--- EXACT CLEAN MARKDOWN EXTRACTED ---\n%s\n--------------------------------------", cleanMarkdown)
 
 	if reductionPct < 80.0 {
 		t.Errorf("Expected token reduction >= 80%%, got %.2f%%", reductionPct)
@@ -347,6 +348,11 @@ func TestTokenReduction_LiveGoDocs(t *testing.T) {
 	t.Logf("Clean Markdown Size  : %d bytes (%d tokens)", len(cleanMD), cleanTokens)
 	t.Logf("Token Reduction      : %.2f%%", reductionPct)
 	t.Logf("Tokens Saved for LLM : %d tokens eliminated", rawTokens-cleanTokens)
+	preview := cleanMD
+	if len(preview) > 600 {
+		preview = preview[:600] + "\n... [truncated for preview]"
+	}
+	t.Logf("\n--- LIVE EXTRACTED MARKDOWN PREVIEW ---\n%s\n---------------------------------------", preview)
 	t.Logf("========================================================")
 }
 
