@@ -1,6 +1,7 @@
 package extractor
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -179,6 +180,141 @@ func TestConvertHTMLToMarkdown_NestedTables(t *testing.T) {
 
 	if strings.Contains(md, "| OuterCol1 | OuterCol2 | InnerColA |") {
 		t.Errorf("Outer table headers corrupted with inner headers:\n%s", md)
+	}
+}
+
+func TestTokenReduction_DocumentationPage(t *testing.T) {
+	// Build a realistic documentation webpage containing standard web boilerplate:
+	// - Top header with navigation links and search bar
+	// - Left sidebar with 35 table-of-contents links
+	// - Large inline script blocks (analytics, telemetry, hydration bundles)
+	// - Inline CSS stylesheets
+	// - Footer with legal disclaimers, sitemap, and copyright
+	// - Core content: technical tutorial with code block and explanations
+
+	var sb strings.Builder
+	sb.WriteString(`<!DOCTYPE html><html lang="en"><head>
+<meta charset="utf-8">
+<title>Building Distributed Systems in Go - Documentation</title>
+<style>
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; margin: 0; padding: 0; background: #fafafa; }
+header { background: #fff; border-bottom: 1px solid #eaeaea; height: 64px; display: flex; align-items: center; justify-content: space-between; padding: 0 24px; }
+.nav-link { color: #555; text-decoration: none; margin-right: 16px; font-size: 14px; }
+.sidebar { width: 280px; border-right: 1px solid #eaeaea; padding: 20px; float: left; height: 100vh; overflow-y: auto; }
+.content { margin-left: 320px; padding: 40px; max-width: 800px; line-height: 1.6; }
+footer { border-top: 1px solid #eaeaea; padding: 32px 24px; background: #fff; margin-top: 80px; color: #888; font-size: 13px; }
+</style>
+<script>
+(function(window, document, tag, url, name) {
+    window['AnalyticsObject'] = name;
+    window[name] = window[name] || function() { (window[name].q = window[name].q || []).push(arguments); };
+    window[name].l = 1 * new Date();
+    var script = document.createElement(tag), first = document.getElementsByTagName(tag)[0];
+    script.async = 1; script.src = url; first.parentNode.insertBefore(script, first);
+})(window, document, 'script', 'https://analytics.example.com/bundle.v2.3.1.js', 'ga');
+ga('create', 'UA-98765432-1', 'auto');
+ga('send', 'pageview');
+console.log("Telemetry initialized for doc page v1.5");
+</script>
+</head>
+<body>
+<header>
+    <div class="logo"><a href="/"><strong>CloudDocs API</strong></a></div>
+    <nav>
+        <a class="nav-link" href="/getting-started">Getting Started</a>
+        <a class="nav-link" href="/guides">Guides</a>
+        <a class="nav-link" href="/api-reference">API Reference</a>
+        <a class="nav-link" href="/pricing">Pricing</a>
+        <a class="nav-link" href="/changelog">Changelog</a>
+        <a class="nav-link" href="/community">Community Forum</a>
+        <a class="nav-link" href="/support">Help & Support</a>
+        <a class="nav-link" href="/login">Sign In</a>
+    </nav>
+</header>
+<aside class="sidebar">
+    <nav>
+        <h3>Table of Contents</h3>
+        <ul>`)
+
+	for i := 1; i <= 35; i++ {
+		sb.WriteString(fmt.Sprintf(`<li><a href="/guide/section-%d">Section %d: Distributed Architecture and Protocols Overview</a></li>`, i, i))
+	}
+
+	sb.WriteString(`</ul>
+    </nav>
+</aside>
+<main class="content">
+    <article>
+        <h1>Distributed Consensus in Go</h1>
+        <p>In distributed computing, consensus algorithms ensure that multiple nodes agree on a shared state machine log even in the presence of network partitions and node crashes.</p>
+        <p>The Raft consensus protocol achieves this by electing a single leader responsible for log replication. If the leader fails, followers start a new election term using randomized election timeouts.</p>
+        <h2>Configuring Raft Nodes</h2>
+        <p>Here is an example demonstrating node configuration using Go:</p>
+        <pre><code>func NewRaftCluster(nodeID string, peers []string) *Raft {
+    return &Raft{
+        id: nodeID,
+        peers: peers,
+        state: Follower,
+        heartbeatTimeout: 150 * time.Millisecond,
+    }
+}</code></pre>
+        <p>Ensure that all peer addresses are reachable via TCP before initializing elections.</p>
+    </article>
+</main>
+<footer>
+    <div class="footer-links">
+        <a href="/privacy">Privacy Policy</a> | 
+        <a href="/terms">Terms of Service</a> | 
+        <a href="/security">Security Disclosures</a> | 
+        <a href="/compliance">SOC2 Compliance</a> | 
+        <a href="/status">System Status</a>
+    </div>
+    <p>&copy; 2026 CloudDocs Platform Inc. All rights reserved. Various trademarks held by their respective owners.</p>
+</footer>
+</body></html>`)
+
+	rawHTML := sb.String()
+	rawTokens := CountBPETokens(rawHTML)
+
+	cleanMarkdown, cleanTokens, title := ConvertHTMLToMarkdown("https://docs.example.com/raft", []byte(rawHTML), "clean_rag")
+
+	if title == "" {
+		t.Errorf("Expected title, got empty")
+	}
+
+	reductionPct := float64(rawTokens-cleanTokens) / float64(rawTokens) * 100.0
+
+	t.Logf("=== Token Reduction Benchmark Results ===")
+	t.Logf("Raw HTML Bytes       : %d bytes", len(rawHTML))
+	t.Logf("Raw HTML BPE Tokens   : %d tokens", rawTokens)
+	t.Logf("Clean Markdown Bytes  : %d bytes", len(cleanMarkdown))
+	t.Logf("Clean Markdown Tokens : %d tokens", cleanTokens)
+	t.Logf("Token Reduction       : %.2f%%", reductionPct)
+
+	if reductionPct < 80.0 {
+		t.Errorf("Expected token reduction >= 80%%, got %.2f%%", reductionPct)
+	}
+
+	// Verify that boilerplate was eliminated
+	if strings.Contains(cleanMarkdown, "Telemetry initialized") {
+		t.Errorf("Script content leaked into clean markdown")
+	}
+	if strings.Contains(cleanMarkdown, "font-family") {
+		t.Errorf("Style content leaked into clean markdown")
+	}
+	if strings.Contains(cleanMarkdown, "Table of Contents") {
+		t.Errorf("Sidebar navigation leaked into clean markdown")
+	}
+	if strings.Contains(cleanMarkdown, "Privacy Policy") {
+		t.Errorf("Footer boilerplate leaked into clean markdown")
+	}
+
+	// Verify core article survived
+	if !strings.Contains(cleanMarkdown, "Distributed Consensus in Go") {
+		t.Errorf("Article heading missing from markdown")
+	}
+	if !strings.Contains(cleanMarkdown, "NewRaftCluster") {
+		t.Errorf("Code block missing from markdown")
 	}
 }
 

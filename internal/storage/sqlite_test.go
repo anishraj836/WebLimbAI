@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -21,6 +22,14 @@ func TestSQLiteStore_BasicCRUD(t *testing.T) {
 
 	if store.DriverName() != "sqlite" {
 		t.Fatalf("Expected driver name 'sqlite', got %s", store.DriverName())
+	}
+
+	var journalMode string
+	if err := store.db.QueryRow("PRAGMA journal_mode;").Scan(&journalMode); err != nil {
+		t.Fatalf("Failed to query journal_mode: %v", err)
+	}
+	if strings.ToLower(journalMode) != "wal" {
+		t.Fatalf("Expected journal_mode 'wal', got %q", journalMode)
 	}
 
 	ctx := context.Background()
