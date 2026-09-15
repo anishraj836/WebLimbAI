@@ -2,8 +2,11 @@ package extractor
 
 import (
 	"fmt"
+	"io"
+	"net/http"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestConvertHTMLToMarkdown(t *testing.T) {
@@ -316,5 +319,34 @@ console.log("Telemetry initialized for doc page v1.5");
 	if !strings.Contains(cleanMarkdown, "NewRaftCluster") {
 		t.Errorf("Code block missing from markdown")
 	}
+}
+
+func TestTokenReduction_LiveGoDocs(t *testing.T) {
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get("https://go.dev/doc/tutorial/getting-started")
+	if err != nil {
+		t.Skipf("Skipping live test due to network unavailability: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	rawHTMLBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("Failed to read body: %v", err)
+	}
+
+	rawTokens := CountBPETokens(string(rawHTMLBytes))
+	cleanMD, cleanTokens, title := ConvertHTMLToMarkdown("https://go.dev/doc/tutorial/getting-started", rawHTMLBytes, "clean_rag")
+
+	reductionPct := float64(rawTokens-cleanTokens) / float64(rawTokens) * 100.0
+
+	t.Logf("================ LIVE GO DOCS BENCHMARK ================")
+	t.Logf("URL                  : https://go.dev/doc/tutorial/getting-started")
+	t.Logf("Title                : %s", title)
+	t.Logf("Raw HTML Size        : %d bytes (%d tokens)", len(rawHTMLBytes), rawTokens)
+	t.Logf("Clean Markdown Size  : %d bytes (%d tokens)", len(cleanMD), cleanTokens)
+	t.Logf("Token Reduction      : %.2f%%", reductionPct)
+	t.Logf("Tokens Saved for LLM : %d tokens eliminated", rawTokens-cleanTokens)
+	t.Logf("========================================================")
 }
 
