@@ -200,6 +200,11 @@ type JobManager struct {
 	ttl          time.Duration
 	closeChan    chan struct{}
 	closeOnce    sync.Once
+	statusKick   chan struct{} // requests an immediate crawl_status heartbeat write
+	statusDone   chan struct{} // closed when the heartbeat goroutine has exited
+	statusOn     atomic.Bool   // crawl_status heartbeat files are written only when enabled
+
+	lastPageIndexedAt atomic.Int64 // unix nanos of the last page a crawl job indexed
 }
 
 func NewJobManager(client *Client, dataDir string) *JobManager {
@@ -208,8 +213,11 @@ func NewJobManager(client *Client, dataDir string) *JobManager {
 		dataDir:    dataDir,
 		ttl:        1 * time.Hour,
 		closeChan:  make(chan struct{}),
+		statusKick: make(chan struct{}, 1),
+		statusDone: make(chan struct{}),
 	}
 	go jm.startJanitor()
+	go jm.runStatusHeartbeat()
 	return jm
 }
 
@@ -276,6 +284,7 @@ func (m *JobManager) CancelJob(jobID string) bool {
 	if job.CancelFunc != nil {
 		job.CancelFunc()
 		job.SetStatus("cancelled")
+		m.kickStatus()
 		return true
 	}
 	return false
@@ -342,6 +351,7 @@ func (m *JobManager) StartCrawl(ctx context.Context, req CrawlRequest) (*CrawlJo
 	}
 
 	m.jobs.Store(jobID, job)
+	m.kickStatus()
 
 	if req.Adaptive {
 		pf, err := NewPriorityFrontier(PriorityFrontierConfig{
@@ -486,6 +496,7 @@ func (m *JobManager) executeAdaptiveCrawl(ctx context.Context, job *CrawlJob, pf
 			job.SetStatus("completed")
 		}
 	}
+	m.kickStatus()
 
 	job.PublishEvent(ui.ProgressEvent{
 		Type:        ui.EventFinish,
@@ -780,6 +791,7 @@ func (m *JobManager) processAdaptiveCrawlItem(ctx context.Context, job *CrawlJob
 	}
 
 	index.GlobalEngine.IndexDocumentWithSource(res.FinalURL, docTitle, bodyForIndexing, termPositions, tokens, "crawl_job", res.FinalURL)
+	m.markPageIndexed()
 
 	newDoc := &storage.CrawledDocument{
 		URL:           res.FinalURL,
@@ -916,6 +928,7 @@ func (m *JobManager) executeCrawl(ctx context.Context, job *CrawlJob, frontier *
 			job.SetStatus("completed")
 		}
 	}
+	m.kickStatus()
 
 	job.PublishEvent(ui.ProgressEvent{
 		Type:        ui.EventFinish,
@@ -1195,6 +1208,7 @@ func (m *JobManager) processCrawlItem(ctx context.Context, job *CrawlJob, fronti
 	}
 
 	index.GlobalEngine.IndexDocumentWithSource(res.FinalURL, docTitle, bodyForIndexing, termPositions, tokens, "crawl_job", res.FinalURL)
+	m.markPageIndexed()
 
 	newDoc := &storage.CrawledDocument{
 		URL:           res.FinalURL,
@@ -1266,4 +1280,6 @@ func (m *JobManager) Close() {
 	m.closeOnce.Do(func() {
 		close(m.closeChan)
 	})
+	// Wait for the final crawl_status write so readers see the last state.
+	<-m.statusDone
 }

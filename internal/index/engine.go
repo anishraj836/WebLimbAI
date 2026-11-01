@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/crawler-monorepo/common/stemmer"
@@ -33,6 +34,9 @@ type Engine struct {
 	aliases        map[string]string
 	parentChunks   map[string][]string
 	chunkOpts      chunker.ChunkingOptions
+
+	lastIndexedAt atomic.Int64 // unix nanos of the last in-memory index write
+	lastSyncAt    atomic.Int64 // unix nanos of the last rebuild from the store
 }
 
 // IndexEngine is a type alias for Engine.
@@ -174,6 +178,7 @@ func (e *Engine) IndexDocumentWithSource(url, title, cleanBody string, termPosit
 	}
 	
 	_ = storage.SaveCrawledDocument(context.Background(), url, title, cleanBody, totalTokens, sourceType, sourceURL)
+	e.markIndexed()
 }
 
 func (e *Engine) IndexDocumentVector(docID, title, body string) {
@@ -308,6 +313,7 @@ func (e *Engine) LoadFromDB(ctx context.Context) error {
 	}
 	e.mu.Unlock()
 
+	e.MarkSyncedFromStore()
 	return nil
 }
 
@@ -365,6 +371,7 @@ func (e *Engine) IndexDocumentIncrementalByURL(ctx context.Context, targetURL st
 		trie.Insert(term, len(positions))
 	}
 	e.IndexDocumentVector(doc.URL, doc.Title, doc.CleanBody)
+	e.markIndexed()
 
 	return nil
 }
@@ -409,6 +416,7 @@ func (e *Engine) IndexDocumentDirectly(docURL, title, cleanBody string, totalTok
 		trie.Insert(term, len(positions))
 	}
 	e.IndexDocumentVector(docURL, title, cleanBody)
+	e.markIndexed()
 }
 
 func (e *Engine) GetInvertedIndex() *InvertedIndex {

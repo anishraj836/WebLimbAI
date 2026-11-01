@@ -20,6 +20,7 @@ mcp-server/agent-limbs-mcp
 # Data and Storage directories
 data/
 raw_html/
+crawl_status/
 *.gz
 
 # Environment and IDE

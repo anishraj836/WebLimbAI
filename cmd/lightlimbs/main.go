@@ -913,6 +913,7 @@ func initStorage(ctx context.Context, dataDir string) {
 		}
 		logger.Log.Info(fmt.Sprintf("Hydrated %d documents into memory from storage (%s)", len(docs), storage.GetGlobalStore().DriverName()))
 	}
+	index.GlobalEngine.MarkSyncedFromStore()
 
 	if ctx == nil {
 		ctx = context.Background()
@@ -1080,6 +1081,7 @@ func runServe(args []string) {
 	initStorage(rootCtx, *dataDir)
 
 	server := NewEmbeddedServer(*dataDir)
+	server.JobManager().EnableStatusFile() // lets a running MCP server report crawl progress
 
 	var raftNode *cluster.RaftNode
 	var coord *cluster.ClusterCoordinator
@@ -1209,6 +1211,15 @@ func runStdioMCP(dataDir string) {
 
 	initStorage(ctx, dataDir)
 	defer saveStorage(dataDir)
+
+	// Let agent_limbs_hybrid_search report crawls running in other processes
+	// (lightlimbs serve / crawl) that share this data directory.
+	statusDir := dataDir
+	if statusDir == "" {
+		statusDir = "data"
+	}
+	mcp.SetDataDir(statusDir)
+	mcp.SetSyncInterval(GetJanitorInterval())
 
 	client := crawler.NewClient()
 	reader := bufio.NewReaderSize(os.Stdin, 64*1024)
@@ -2111,6 +2122,7 @@ func runCrawlWithClient(client *crawler.Client, args []string) {
 	loadSnapshotsForCLI(*dataDir)
 	jm := crawler.NewJobManager(client, *dataDir)
 	defer jm.Close()
+	jm.EnableStatusFile() // lets a running MCP server report this crawl's progress
 
 	req := crawler.CrawlRequest{
 		URL:              seedURL,

@@ -174,7 +174,7 @@ func HandleRPCMessage(raw []byte, client *crawler.Client) (respBytes []byte, err
 			},
 			{
 				Name:        "agent_limbs_hybrid_search",
-				Description: "Sub-millisecond hybrid search (BM25 keyword matching + Int8 dense vector semantic similarity with Reciprocal Rank Fusion) over all crawled and indexed documentation.",
+				Description: "Sub-millisecond hybrid search (BM25 keyword matching + Int8 dense vector semantic similarity with Reciprocal Rank Fusion) over all crawled and indexed documentation. Returns JSON with hits plus retrieval_status: 'complete' (ingestion finished; best matches among indexed pages), 'partial' (a crawl is still running; search again later), 'stale' (pages crawled elsewhere are not synced yet), 'weak_match' (indexed pages probably don't cover the topic; scrape more), or 'empty' (nothing indexed; scrape first). Only previously scraped or crawled pages are searchable. Follow the 'hint' field before treating results as final.",
 				InputSchema: ToolSchema{
 					Type: "object",
 					Properties: map[string]Property{
@@ -430,27 +430,19 @@ func HandleRPCMessage(raw []byte, client *crawler.Client) (respBytes []byte, err
 				fetchK = 10
 			}
 
+			var fusedHits []search.HybridSearchHit
 			titles, urls, bodies := index.GlobalEngine.GetMetadataMaps()
-			if len(titles) == 0 {
-				toolResult = CallToolResult{
-					Content: []ToolContent{
-						{Type: "text", Text: fmt.Sprintf("No indexed documents found in memory for query '%s'. Scrape target URLs first using agent_limbs_scrape.", query)},
-					},
-				}
-				break
+			if len(titles) > 0 {
+				bm25Hits := index.GlobalEngine.SearchBM25(query, fetchK)
+				vectorHits := index.GlobalEngine.SearchVector(query, fetchK)
+				fusedHits = search.ReciprocalRankFusion(query, bm25Hits, vectorHits, limit, titles, urls, bodies)
 			}
 
-			bm25Hits := index.GlobalEngine.SearchBM25(
-				query,
-				fetchK,
-			)
-			vectorHits := index.GlobalEngine.SearchVector(query, fetchK)
-			fusedHits := search.ReciprocalRankFusion(query, bm25Hits, vectorHits, limit, titles, urls, bodies)
-			if fusedHits == nil {
-				fusedHits = []search.HybridSearchHit{}
-			}
-
-			resJSON, _ := json.MarshalIndent(fusedHits, "", "  ")
+			// Wrap hits with coverage + ingestion status so the agent can tell
+			// final results from partial ones (crawl still running, stale index,
+			// or a topic the indexed pages don't cover).
+			searchResp := BuildHybridSearchResponse(index.GlobalEngine, query, fusedHits)
+			resJSON, _ := json.MarshalIndent(searchResp, "", "  ")
 			toolResult = CallToolResult{
 				Content: []ToolContent{
 					{Type: "text", Text: string(resJSON)},
