@@ -189,41 +189,7 @@ func (s *SQLiteStore) loadAliases(ctx context.Context) error {
 	return rows.Err()
 }
 
-// Save persists a document with an optional TTL duration.
-func (s *SQLiteStore) Save(ctx context.Context, doc *CrawledDocument, ttl time.Duration) error {
-	if s.db == nil {
-		return errors.New("sqlite db is nil")
-	}
-	if doc == nil || doc.URL == "" {
-		return errors.New("cannot save nil or empty URL document")
-	}
-
-	sourceType := doc.SourceType
-	if sourceType == "" {
-		sourceType = "web_crawled"
-	}
-	sourceURL := doc.SourceURL
-	if sourceURL == "" {
-		sourceURL = doc.URL
-	}
-
-	var expiresAt *time.Time
-	if ttl != 0 {
-		exp := time.Now().Add(ttl)
-		expiresAt = &exp
-	} else if doc.ExpiresAt != nil {
-		expiresAt = doc.ExpiresAt
-	}
-
-	var expiresAtStr sql.NullString
-	if expiresAt != nil {
-		expiresAtStr = sql.NullString{String: expiresAt.UTC().Format("2006-01-02 15:04:05"), Valid: true}
-	}
-
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-
-	query := `
+const sqliteSaveQuery = `
 	INSERT INTO crawled_pages (url, title, clean_body, total_tokens, source_type, source_url, expires_at)
 	VALUES (?, ?, ?, ?, ?, ?, ?)
 	ON CONFLICT(url) DO UPDATE SET
@@ -234,19 +200,25 @@ func (s *SQLiteStore) Save(ctx context.Context, doc *CrawledDocument, ttl time.D
 		source_url   = excluded.source_url,
 		expires_at   = excluded.expires_at;
 	`
-	_, err := s.db.ExecContext(ctx, query, doc.URL, doc.Title, doc.CleanBody, doc.TotalTokens, sourceType, sourceURL, expiresAtStr)
-	return err
+
+func sqliteExpiry(doc *CrawledDocument, ttl time.Duration) sql.NullString {
+	var expiresAt *time.Time
+	if ttl != 0 {
+		exp := time.Now().Add(ttl)
+		expiresAt = &exp
+	} else if doc.ExpiresAt != nil {
+		expiresAt = doc.ExpiresAt
+	}
+	if expiresAt == nil {
+		return sql.NullString{}
+	}
+	return sql.NullString{String: expiresAt.UTC().Format("2006-01-02 15:04:05"), Valid: true}
 }
 
-// UpsertDocument updates or inserts a document with complete metadata.
-func (s *SQLiteStore) UpsertDocument(ctx context.Context, doc *CrawledDocument, ttl time.Duration) error {
-	if s.db == nil {
-		return errors.New("sqlite db is nil")
-	}
+func sqliteSaveArgs(doc *CrawledDocument, ttl time.Duration) ([]any, error) {
 	if doc == nil || doc.URL == "" {
-		return errors.New("cannot upsert nil or empty URL document")
+		return nil, errors.New("cannot save nil or empty URL document")
 	}
-
 	sourceType := doc.SourceType
 	if sourceType == "" {
 		sourceType = "web_crawled"
@@ -255,39 +227,26 @@ func (s *SQLiteStore) UpsertDocument(ctx context.Context, doc *CrawledDocument, 
 	if sourceURL == "" {
 		sourceURL = doc.URL
 	}
+	return []any{doc.URL, doc.Title, doc.CleanBody, doc.TotalTokens, sourceType, sourceURL, sqliteExpiry(doc, ttl)}, nil
+}
 
-	var expiresAt *time.Time
-	if ttl != 0 {
-		exp := time.Now().Add(ttl)
-		expiresAt = &exp
-	} else if doc.ExpiresAt != nil {
-		expiresAt = doc.ExpiresAt
+// Save persists a document with an optional TTL duration.
+func (s *SQLiteStore) Save(ctx context.Context, doc *CrawledDocument, ttl time.Duration) error {
+	if s.db == nil {
+		return errors.New("sqlite db is nil")
 	}
-
-	var expiresAtStr sql.NullString
-	if expiresAt != nil {
-		expiresAtStr = sql.NullString{String: expiresAt.UTC().Format("2006-01-02 15:04:05"), Valid: true}
-	}
-
-	lastCrawledAt := doc.LastCrawledAt
-	if lastCrawledAt.IsZero() {
-		lastCrawledAt = time.Now()
-	}
-	lastCrawledStr := lastCrawledAt.UTC().Format("2006-01-02 15:04:05")
-
-	links := doc.OutboundLinks
-	if links == nil {
-		links = []string{}
-	}
-	linksBytes, _ := json.Marshal(links)
-	if len(linksBytes) == 0 {
-		linksBytes = []byte("[]")
+	args, err := sqliteSaveArgs(doc, ttl)
+	if err != nil {
+		return err
 	}
 
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	_, err = s.db.ExecContext(ctx, sqliteSaveQuery, args...)
+	return err
+}
 
-	query := `
+const sqliteUpsertQuery = `
 	INSERT INTO crawled_pages (
 		url, title, clean_body, total_tokens, source_type, source_url, expires_at,
 		etag, last_modified, content_hash, last_crawled_at, http_status, outbound_links
@@ -307,12 +266,106 @@ func (s *SQLiteStore) UpsertDocument(ctx context.Context, doc *CrawledDocument, 
 		http_status     = excluded.http_status,
 		outbound_links  = excluded.outbound_links;
 	`
-	_, err := s.db.ExecContext(
-		ctx, query,
-		doc.URL, doc.Title, doc.CleanBody, doc.TotalTokens, sourceType, sourceURL, expiresAtStr,
+
+func sqliteUpsertArgs(doc *CrawledDocument, ttl time.Duration) ([]any, error) {
+	if doc == nil || doc.URL == "" {
+		return nil, errors.New("cannot upsert nil or empty URL document")
+	}
+	sourceType := doc.SourceType
+	if sourceType == "" {
+		sourceType = "web_crawled"
+	}
+	sourceURL := doc.SourceURL
+	if sourceURL == "" {
+		sourceURL = doc.URL
+	}
+
+	lastCrawledAt := doc.LastCrawledAt
+	if lastCrawledAt.IsZero() {
+		lastCrawledAt = time.Now()
+	}
+	lastCrawledStr := lastCrawledAt.UTC().Format("2006-01-02 15:04:05")
+
+	links := doc.OutboundLinks
+	if links == nil {
+		links = []string{}
+	}
+	linksBytes, _ := json.Marshal(links)
+	if len(linksBytes) == 0 {
+		linksBytes = []byte("[]")
+	}
+
+	return []any{
+		doc.URL, doc.Title, doc.CleanBody, doc.TotalTokens, sourceType, sourceURL, sqliteExpiry(doc, ttl),
 		doc.ETag, doc.LastModified, doc.ContentHash, lastCrawledStr, doc.HTTPStatus, string(linksBytes),
-	)
+	}, nil
+}
+
+// UpsertDocument updates or inserts a document with complete metadata.
+func (s *SQLiteStore) UpsertDocument(ctx context.Context, doc *CrawledDocument, ttl time.Duration) error {
+	if s.db == nil {
+		return errors.New("sqlite db is nil")
+	}
+	args, err := sqliteUpsertArgs(doc, ttl)
+	if err != nil {
+		return err
+	}
+
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	_, err = s.db.ExecContext(ctx, sqliteUpsertQuery, args...)
 	return err
+}
+
+// WriteBatch applies several writes in one transaction, so a batch costs one
+// WAL commit instead of one per document. Either every write in the batch is
+// committed or none is.
+func (s *SQLiteStore) WriteBatch(ctx context.Context, ops []BatchWrite) error {
+	if s.db == nil {
+		return errors.New("sqlite db is nil")
+	}
+	if len(ops) == 0 {
+		return nil
+	}
+
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	saveStmt, err := tx.PrepareContext(ctx, sqliteSaveQuery)
+	if err != nil {
+		return err
+	}
+	defer saveStmt.Close()
+	upsertStmt, err := tx.PrepareContext(ctx, sqliteUpsertQuery)
+	if err != nil {
+		return err
+	}
+	defer upsertStmt.Close()
+
+	for i := range ops {
+		op := &ops[i]
+		var args []any
+		stmt := saveStmt
+		if op.Upsert {
+			stmt = upsertStmt
+			args, err = sqliteUpsertArgs(&op.Doc, op.TTL)
+		} else {
+			args, err = sqliteSaveArgs(&op.Doc, op.TTL)
+		}
+		if err != nil {
+			return err
+		}
+		if _, err := stmt.ExecContext(ctx, args...); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // GetByURL retrieves a single document by its canonical or alias URL.

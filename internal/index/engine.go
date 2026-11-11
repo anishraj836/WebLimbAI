@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/crawler-monorepo/common/stemmer"
@@ -24,15 +25,20 @@ var (
 // Engine is the central hybrid search and indexing engine.
 type Engine struct {
 	mu             sync.RWMutex
-	shards         [64]MetadataShard
+	shards         []MetadataShard
+	shardMask      uint32
 	Inverted       *InvertedIndex
 	Trie           *Trie
 	Vector         *VectorIndex
 	ActiveEmbedder Embedder
 	aliasesMu      sync.RWMutex
 	aliases        map[string]string
-	parentChunks   map[string][]string
 	chunkOpts      chunker.ChunkingOptions
+
+	// Cached merged view of the metadata shards (see GetMetadataMaps).
+	metaVersion atomic.Uint64
+	metaCacheMu sync.Mutex
+	metaCache   *metadataView
 }
 
 // IndexEngine is a type alias for Engine.
@@ -49,7 +55,7 @@ func WithEmbedder(emb Embedder) Option {
 	return func(e *Engine) {
 		if emb != nil {
 			e.ActiveEmbedder = emb
-			e.Vector = NewVectorIndex(emb.Dimensions())
+			e.Vector = NewVectorIndexWithShards(emb.Dimensions(), PrecisionFloat32, e.ShardCount())
 		}
 	}
 }
@@ -58,9 +64,35 @@ func WithEmbedder(emb Embedder) Option {
 func WithDimensions(dim int) Option {
 	return func(e *Engine) {
 		if dim > 0 {
-			e.Vector = NewVectorIndex(dim)
+			e.Vector = NewVectorIndexWithShards(dim, PrecisionFloat32, e.ShardCount())
 		}
 	}
+}
+
+// WithIndexShards sets the number of lock stripes (rounded up to a power of
+// two, default 64) for the metadata, inverted index, trie and vector index.
+// It resets the engine to empty, so it belongs in NewEngine's options.
+func WithIndexShards(n int) Option {
+	return func(e *Engine) {
+		e.resetShards(normalizeShardCount(n))
+	}
+}
+
+// resetShards replaces every per-document structure with empty ones split
+// into n stripes, keeping the vector dimensions and precision.
+func (e *Engine) resetShards(n int) {
+	dim, prec := 0, PrecisionFloat32
+	if e.Vector != nil {
+		dim, prec = e.Vector.Dimensions(), e.Vector.GetPrecision()
+	} else if e.ActiveEmbedder != nil {
+		dim = e.ActiveEmbedder.Dimensions()
+	}
+	e.shards = newMetadataShards(n)
+	e.shardMask = uint32(n - 1)
+	e.Inverted = NewInvertedIndexWithShards(n)
+	e.Trie = NewTrieWithShards(n)
+	e.Vector = NewVectorIndexWithShards(dim, prec, n)
+	e.metaVersion.Add(1)
 }
 
 func WithChunkingOptions(opts chunker.ChunkingOptions) Option {
@@ -73,19 +105,11 @@ func WithChunkingOptions(opts chunker.ChunkingOptions) Option {
 func NewEngine(opts ...Option) *Engine {
 	active := NewEmbedderFromEnv()
 	e := &Engine{
-		Inverted:       NewInvertedIndex(),
-		Trie:           NewTrie(),
-		Vector:         NewVectorIndex(active.Dimensions()),
 		ActiveEmbedder: active,
 		aliases:        make(map[string]string),
-		parentChunks:   make(map[string][]string),
 		chunkOpts:      chunker.DefaultChunkingOptions(),
 	}
-	for i := 0; i < 64; i++ {
-		e.shards[i].titles = make(map[string]string)
-		e.shards[i].urls = make(map[string]string)
-		e.shards[i].bodies = make(map[string]string)
-	}
+	e.resetShards(shardCountFromEnv())
 
 	for _, opt := range opts {
 		if opt != nil {
@@ -109,49 +133,31 @@ func (e *Engine) IndexDocumentWithSource(url, title, cleanBody string, termPosit
 	e.DeleteDocument(url) // Purge old first (atomic replacement)
 
 	docID := url
+	e.putMetadata(docID, title, url, cleanBody)
 
-	shard := e.getShard(docID)
-	shard.mu.Lock()
-	shard.titles[docID] = title
-	shard.urls[docID] = url
-	shard.bodies[docID] = cleanBody
-	shard.mu.Unlock()
-
+	// e.mu is only read-locked here: it keeps LoadFromDB from swapping the
+	// indexes mid-write. Writers don't exclude each other on it; they only
+	// contend on the shard that owns their document.
 	e.mu.RLock()
 	e.Inverted.AddDocument(docID, termPositions, totalTokens)
 	for term, positions := range termPositions {
 		e.Trie.Insert(term, len(positions))
 	}
+	opts := e.chunkOpts
 	e.mu.RUnlock()
 
 	e.IndexDocumentVector(docID, title, cleanBody)
 
-	// Chunking
-	e.mu.RLock()
-	opts := e.chunkOpts
-	e.mu.RUnlock()
-
 	chunks := chunker.ChunkDocument(url, title, cleanBody, opts)
-	
-	var chunkIDs []string
+	chunkIDs := make([]string, 0, len(chunks))
 	for _, c := range chunks {
 		chunkIDs = append(chunkIDs, c.ID)
 	}
-	
-	e.mu.Lock()
-	if e.parentChunks == nil {
-		e.parentChunks = make(map[string][]string)
-	}
-	e.parentChunks[url] = chunkIDs
-	e.mu.Unlock()
+	e.setChunkIDs(url, chunkIDs)
 
 	for _, c := range chunks {
-		cShard := e.getShard(c.ID)
-		cShard.mu.Lock()
-		cShard.titles[c.ID] = title + " (Chunk " + fmt.Sprint(c.ChunkIndex) + ")"
-		cShard.urls[c.ID] = url
-		cShard.mu.Unlock()
-		
+		e.putMetadata(c.ID, title+" (Chunk "+fmt.Sprint(c.ChunkIndex)+")", url, "")
+
 		cRawTokens := strings.Fields(strings.ToLower(c.Content))
 		cTermPositions := make(map[string][]int)
 		for idx, raw := range cRawTokens {
@@ -162,17 +168,17 @@ func (e *Engine) IndexDocumentWithSource(url, title, cleanBody string, termPosit
 			stemmed := stemmer.Stem(clean)
 			cTermPositions[stemmed] = append(cTermPositions[stemmed], idx)
 		}
-		
+
 		e.mu.RLock()
 		e.Inverted.AddDocument(c.ID, cTermPositions, c.Tokens)
 		for term, positions := range cTermPositions {
 			e.Trie.Insert(term, len(positions))
 		}
 		e.mu.RUnlock()
-		
+
 		e.IndexDocumentVector(c.ID, title, c.Content)
 	}
-	
+
 	_ = storage.SaveCrawledDocument(context.Background(), url, title, cleanBody, totalTokens, sourceType, sourceURL)
 }
 
@@ -199,10 +205,8 @@ func (e *Engine) LoadFromDB(ctx context.Context) error {
 		return err
 	}
 
-	newInv := NewInvertedIndex()
-	newTrie := NewTrie()
-
 	e.mu.RLock()
+	n := len(e.shards)
 	opts := e.chunkOpts
 	dim := 384
 	if e.Vector != nil && e.Vector.dimensions > 0 {
@@ -213,15 +217,11 @@ func (e *Engine) LoadFromDB(ctx context.Context) error {
 	embedder := e.ActiveEmbedder
 	e.mu.RUnlock()
 
-	newVector := NewVectorIndex(dim)
-	newParentChunks := make(map[string][]string)
-
-	var newShards [64]MetadataShard
-	for i := 0; i < 64; i++ {
-		newShards[i].titles = make(map[string]string)
-		newShards[i].urls = make(map[string]string)
-		newShards[i].bodies = make(map[string]string)
-	}
+	newInv := NewInvertedIndexWithShards(n)
+	newTrie := NewTrieWithShards(n)
+	newVector := NewVectorIndexWithShards(dim, PrecisionFloat32, n)
+	newShards := newMetadataShards(n)
+	mask := uint32(n - 1)
 
 	for _, d := range docs {
 		rawTokens := strings.Fields(strings.ToLower(d.CleanBody))
@@ -235,7 +235,7 @@ func (e *Engine) LoadFromDB(ctx context.Context) error {
 			termPositions[stemmed] = append(termPositions[stemmed], idx)
 		}
 
-		sIdx := getShardIndex(d.URL)
+		sIdx := fnv1a32(d.URL) & mask
 		newShards[sIdx].titles[d.URL] = d.Title
 		newShards[sIdx].urls[d.URL] = d.URL
 		newShards[sIdx].bodies[d.URL] = d.CleanBody
@@ -263,7 +263,7 @@ func (e *Engine) LoadFromDB(ctx context.Context) error {
 		for _, c := range chunks {
 			chunkIDs = append(chunkIDs, c.ID)
 			
-			cShardIdx := getShardIndex(c.ID)
+			cShardIdx := fnv1a32(c.ID) & mask
 			newShards[cShardIdx].titles[c.ID] = d.Title + " (Chunk " + fmt.Sprint(c.ChunkIndex) + ")"
 			newShards[cShardIdx].urls[c.ID] = d.URL
 			
@@ -290,23 +290,24 @@ func (e *Engine) LoadFromDB(ctx context.Context) error {
 				}
 			}
 		}
-		newParentChunks[d.URL] = chunkIDs
+		newShards[sIdx].chunks[d.URL] = chunkIDs
 
 	}
 
 	e.mu.Lock()
-	e.parentChunks = newParentChunks
 	e.Inverted = newInv
 	e.Trie = newTrie
 	e.Vector = newVector
-	for i := 0; i < 64; i++ {
+	for i := range e.shards {
 		e.shards[i].mu.Lock()
 		e.shards[i].titles = newShards[i].titles
 		e.shards[i].urls = newShards[i].urls
 		e.shards[i].bodies = newShards[i].bodies
+		e.shards[i].chunks = newShards[i].chunks
 		e.shards[i].mu.Unlock()
 	}
 	e.mu.Unlock()
+	e.metaVersion.Add(1)
 
 	return nil
 }
@@ -348,12 +349,7 @@ func (e *Engine) IndexDocumentIncrementalByURL(ctx context.Context, targetURL st
 		termPositions[stemmed] = append(termPositions[stemmed], idx)
 	}
 
-	shard := e.getShard(doc.URL)
-	shard.mu.Lock()
-	shard.titles[doc.URL] = doc.Title
-	shard.urls[doc.URL] = doc.URL
-	shard.bodies[doc.URL] = doc.CleanBody
-	shard.mu.Unlock()
+	e.putMetadata(doc.URL, doc.Title, doc.URL, doc.CleanBody)
 
 	e.mu.RLock()
 	inv := e.Inverted
@@ -392,12 +388,7 @@ func (e *Engine) IndexDocumentDirectly(docURL, title, cleanBody string, totalTok
 		termPositions[stemmed] = append(termPositions[stemmed], idx)
 	}
 
-	shard := e.getShard(docURL)
-	shard.mu.Lock()
-	shard.titles[docURL] = title
-	shard.urls[docURL] = docURL
-	shard.bodies[docURL] = cleanBody
-	shard.mu.Unlock()
+	e.putMetadata(docURL, title, docURL, cleanBody)
 
 	e.mu.RLock()
 	inv := e.Inverted
@@ -453,19 +444,10 @@ func (e *Engine) SearchVector(query string, topK int) []VectorSearchResult {
 	return vectorIdx.SearchNearest(queryVec, topK)
 }
 
-// DeleteDocument removes a document from the local metadata shards, inverted index, and vector index.
+// DeleteDocument removes a document and its chunks from the metadata shards,
+// inverted index and vector index. Each removal locks only the owning shard.
 func (e *Engine) DeleteDocument(docURL string) {
-	e.mu.Lock()
-	chunks := e.parentChunks[docURL]
-	delete(e.parentChunks, docURL)
-	e.mu.Unlock()
-
-	shard := e.getShard(docURL)
-	shard.mu.Lock()
-	delete(shard.titles, docURL)
-	delete(shard.urls, docURL)
-	delete(shard.bodies, docURL)
-	shard.mu.Unlock()
+	chunks := e.deleteMetadata(docURL)
 
 	e.mu.RLock()
 	inv := e.Inverted
@@ -484,15 +466,7 @@ func (e *Engine) DeleteDocument(docURL string) {
 			vectorIdx.DeleteVector(cID)
 		}
 	}
-	
-	// Also delete chunks from shards
 	for _, cID := range chunks {
-		cShard := e.getShard(cID)
-		cShard.mu.Lock()
-		delete(cShard.titles, cID)
-		delete(cShard.urls, cID)
-		delete(cShard.bodies, cID)
-		cShard.mu.Unlock()
+		e.deleteMetadata(cID)
 	}
 }
-

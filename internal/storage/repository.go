@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/crawler-monorepo/common/utils"
@@ -21,7 +22,54 @@ var Pool *pgxpool.Pool
 
 var (
 	repoMu sync.Mutex
+
+	// asyncWriter, when set, receives Save/Upsert calls made through the
+	// package-level helpers below instead of the store committing inline.
+	asyncWriter atomic.Pointer[AsyncWriter]
 )
+
+// EnableAsyncWrites routes SaveCrawledDocument and UpsertCrawledDocument
+// through a background batching writer for the current global store. Long
+// crawls enable it; one-off tools keep synchronous writes. It returns the
+// writer so callers can inspect Stats.
+func EnableAsyncWrites(cfg AsyncWriterConfig) *AsyncWriter {
+	w := NewAsyncWriter(GetGlobalStore(), cfg)
+	if old := asyncWriter.Swap(w); old != nil {
+		old.Close()
+	}
+	return w
+}
+
+// DisableAsyncWrites flushes queued writes and returns to synchronous writes.
+func DisableAsyncWrites() {
+	if w := asyncWriter.Swap(nil); w != nil {
+		w.Close()
+	}
+}
+
+// FlushPendingWrites blocks until all queued writes are committed. It is a
+// no-op when async writes are disabled.
+func FlushPendingWrites(ctx context.Context) error {
+	if w := asyncWriter.Load(); w != nil {
+		return w.Flush(ctx)
+	}
+	return nil
+}
+
+// AsyncWriteStats reports the active async writer's counters, if any.
+func AsyncWriteStats() (AsyncWriterStats, bool) {
+	if w := asyncWriter.Load(); w != nil {
+		return w.Stats(), true
+	}
+	return AsyncWriterStats{}, false
+}
+
+// flushBeforeRead makes whole-table reads include queued writes.
+func flushBeforeRead(ctx context.Context) {
+	if w := asyncWriter.Load(); w != nil {
+		_ = w.Flush(ctx)
+	}
+}
 
 // InitDB initializes the database and updates the global store.
 // If databaseURL is provided, it connects to PostgreSQL or SQLite; otherwise it initializes SQLite/File fallback.
@@ -133,26 +181,41 @@ func SaveCrawledDocumentWithTTL(ctx context.Context, url, title, cleanBody strin
 		SourceType:  sourceType,
 		SourceURL:   sourceURL,
 	}
+	if w := asyncWriter.Load(); w != nil && w.Enqueue(BatchWrite{Doc: *doc, TTL: ttl}) {
+		return nil
+	}
 	return GetGlobalStore().Save(ctx, doc, ttl)
 }
 
 // UpsertCrawledDocument inserts or updates a document.
 func UpsertCrawledDocument(ctx context.Context, doc *CrawledDocument, ttl time.Duration) error {
+	if doc != nil {
+		if w := asyncWriter.Load(); w != nil && w.Enqueue(BatchWrite{Doc: *doc, TTL: ttl, Upsert: true}) {
+			return nil
+		}
+	}
 	return GetGlobalStore().UpsertDocument(ctx, doc, ttl)
 }
 
 // GetCrawledDocuments returns all active stored documents.
 func GetCrawledDocuments(ctx context.Context) ([]CrawledDocument, error) {
+	flushBeforeRead(ctx)
 	return GetGlobalStore().List(ctx, 0, 0)
 }
 
 // GetCrawledDocumentByURL retrieves a document by URL or alias.
 func GetCrawledDocumentByURL(ctx context.Context, targetURL string) (*CrawledDocument, error) {
+	if w := asyncWriter.Load(); w != nil {
+		if doc, ok := w.Pending(targetURL); ok {
+			return doc, nil // queued but not yet committed: read your own write
+		}
+	}
 	return GetGlobalStore().GetByURL(ctx, targetURL)
 }
 
 // DeleteExpiredDocuments cleans up any expired documents across the active storage backend.
 func DeleteExpiredDocuments(ctx context.Context) (int64, error) {
+	flushBeforeRead(ctx)
 	return GetGlobalStore().DeleteExpired(ctx)
 }
 
@@ -175,6 +238,7 @@ func GetStoragePath() string {
 
 // CloseDB closes the active database connection pool.
 func CloseDB() {
+	DisableAsyncWrites() // commit anything still queued before closing
 	repoMu.Lock()
 	defer repoMu.Unlock()
 	if Pool != nil {
@@ -190,6 +254,7 @@ func CloseDB() {
 
 // DeleteCrawledDocument deletes a document by URL or source URL.
 func DeleteCrawledDocument(ctx context.Context, url string) error {
+	flushBeforeRead(ctx) // a queued write must not resurrect the row after the delete
 	store := GetGlobalStore()
 	if sq, ok := store.(*SQLiteStore); ok {
 		return sq.DeleteCrawledDocument(ctx, url)
@@ -208,6 +273,7 @@ func GetOutboundLinks(ctx context.Context, url string) ([]string, error) {
 
 // GetDocumentMetadataBySource retrieves documents matching sourceType.
 func GetDocumentMetadataBySource(ctx context.Context, sourceType string, limit, offset int) ([]CrawledDocument, error) {
+	flushBeforeRead(ctx)
 	store := GetGlobalStore()
 	if sq, ok := store.(*SQLiteStore); ok {
 		return sq.GetDocumentMetadataBySource(ctx, sourceType, limit, offset)
@@ -217,6 +283,7 @@ func GetDocumentMetadataBySource(ctx context.Context, sourceType string, limit, 
 
 // GetDocumentsCount returns total active document count.
 func GetDocumentsCount(ctx context.Context) (int64, error) {
+	flushBeforeRead(ctx)
 	store := GetGlobalStore()
 	if sq, ok := store.(*SQLiteStore); ok {
 		return sq.GetDocumentsCount(ctx)

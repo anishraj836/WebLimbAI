@@ -921,6 +921,7 @@ func initStorage(ctx context.Context, dataDir string) {
 }
 
 func saveStorage(dataDir string) {
+	storage.DisableAsyncWrites() // commit queued page writes before closing
 	if dataDir == "" {
 		dataDir = "data"
 	}
@@ -1078,6 +1079,8 @@ func runServe(args []string) {
 
 	setupStorage(*dataDir, *dbType, *sqlitePath)
 	initStorage(rootCtx, *dataDir)
+	// Crawl jobs started over REST write through the async batching writer.
+	storage.EnableAsyncWrites(storage.AsyncWriterConfig{})
 
 	server := NewEmbeddedServer(*dataDir)
 
@@ -2108,6 +2111,9 @@ func runCrawlWithClient(client *crawler.Client, args []string) {
 	}
 
 	setupStorage(*dataDir, *dbType, *sqlitePath)
+	// Crawl workers enqueue page writes; one background writer commits them
+	// to SQLite in batched transactions. saveStorage flushes before exit.
+	storage.EnableAsyncWrites(storage.AsyncWriterConfig{})
 	loadSnapshotsForCLI(*dataDir)
 	jm := crawler.NewJobManager(client, *dataDir)
 	defer jm.Close()

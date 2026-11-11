@@ -93,52 +93,64 @@ func RankDocuments(
 		return nil
 	}
 
-	invIndex.mu.RLock()
-	totalDocs := invIndex.totalDocuments
-	totalDocLength := invIndex.totalDocLength
-	if totalDocs == 0 {
-		invIndex.mu.RUnlock()
+	if invIndex == nil {
 		return nil
 	}
-	avgDocLen := float64(totalDocLength) / float64(totalDocs)
-
-	docScores := make(map[string]float64)
-	docMatchCounts := make(map[string]int)
-
-	for _, term := range stemmedTokens {
-		pl, exists := invIndex.postings[term]
-		if !exists {
-			continue
-		}
-
-		idf := ComputeIDF(totalDocs, pl.DocumentFrequency)
-		for _, entry := range pl.Entries {
-			docLen := invIndex.docLengths[entry.DocID]
-			score := ComputeBM25Score(entry.TermFrequency, docLen, avgDocLen, idf)
-			docScores[entry.DocID] += score
-			docMatchCounts[entry.DocID]++
-		}
+	docScores, docMatchCounts := invIndex.scoreTerms(stemmedTokens)
+	if len(docScores) == 0 {
+		return nil
 	}
-	invIndex.mu.RUnlock()
 
-	// Aggregate hits by base URL to eliminate duplicate chunk hits while retaining highest score and best snippet
-	urlHits := make(map[string]SearchHit)
+	// Aggregate hits by base URL so several chunks of one page count once,
+	// keeping the best-scoring chunk. Snippets are expensive (they lowercase,
+	// split and stem the whole body), so they are generated only for the
+	// final top-K hits instead of for every matching document.
+	type urlBest struct {
+		docID string
+		score float64
+	}
+	best := make(map[string]urlBest, len(docScores))
 	for docID, score := range docScores {
-		rawURL := docURLs[docID]
-		baseURL := rawURL
+		baseURL := docURLs[docID]
 		if baseURL == "" {
 			baseURL = docID
 		}
 		if idx := strings.Index(baseURL, "#chunk"); idx != -1 {
 			baseURL = baseURL[:idx]
 		}
+		rounded := math.Round(score*1000) / 1000
+		if cur, found := best[baseURL]; !found || rounded > cur.score ||
+			(rounded == cur.score && docID < cur.docID) {
+			best[baseURL] = urlBest{docID: docID, score: rounded}
+		}
+	}
+
+	type ranked struct {
+		baseURL string
+		urlBest
+	}
+	order := make([]ranked, 0, len(best))
+	for baseURL, bst := range best {
+		order = append(order, ranked{baseURL: baseURL, urlBest: bst})
+	}
+	sort.Slice(order, func(i, j int) bool {
+		if order[i].score != order[j].score {
+			return order[i].score > order[j].score
+		}
+		return order[i].baseURL < order[j].baseURL
+	})
+	if len(order) > topK {
+		order = order[:topK]
+	}
+
+	hits := make([]SearchHit, len(order))
+	for i, r := range order {
+		docID, baseURL := r.docID, r.baseURL
 
 		body := docBodies[docID]
 		if body == "" && docID != baseURL {
 			body = docBodies[baseURL]
 		}
-		snippet := GenerateHighlightedSnippet(body, queryTerms, 180)
-
 		title := docTitles[docID]
 		if title == "" {
 			title = docTitles[baseURL]
@@ -146,32 +158,14 @@ func RankDocuments(
 				title = baseURL
 			}
 		}
-
-		roundedScore := math.Round(score*1000) / 1000
-		existing, found := urlHits[baseURL]
-		if !found || roundedScore > existing.Score {
-			urlHits[baseURL] = SearchHit{
-				DocID:      baseURL,
-				Score:      roundedScore,
-				Title:      title,
-				URL:        baseURL,
-				Snippet:    snippet,
-				MatchCount: docMatchCounts[docID],
-			}
+		hits[i] = SearchHit{
+			DocID:      baseURL,
+			Score:      r.score,
+			Title:      title,
+			URL:        baseURL,
+			Snippet:    GenerateHighlightedSnippet(body, queryTerms, 180),
+			MatchCount: docMatchCounts[docID],
 		}
-	}
-
-	var hits []SearchHit
-	for _, hit := range urlHits {
-		hits = append(hits, hit)
-	}
-
-	sort.Slice(hits, func(i, j int) bool {
-		return hits[i].Score > hits[j].Score
-	})
-
-	if len(hits) > topK {
-		hits = hits[:topK]
 	}
 
 	return hits

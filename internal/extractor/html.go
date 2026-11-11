@@ -1,6 +1,7 @@
 package extractor
 
 import (
+	"log"
 	"bytes"
 	"encoding/json"
 	"fmt"
@@ -21,8 +22,21 @@ var (
 func getGlobalTiktokenCodec() (*tiktoken.Tiktoken, error) {
 	globalTiktokenOnce.Do(func() {
 		globalTiktokenCodec, globalTiktokenErr = tiktoken.GetEncoding("cl100k_base")
+		if globalTiktokenErr != nil {
+			log.Printf("[extractor] WARNING: cl100k_base tokenizer unavailable (%v); "+
+				"CountBPETokens is falling back to whitespace word counts, so token "+
+				"numbers are NOT BPE tokens", globalTiktokenErr)
+		}
 	})
 	return globalTiktokenCodec, globalTiktokenErr
+}
+
+// TokenizerStatus reports whether CountBPETokens is using the real
+// cl100k_base BPE tokenizer. A non-nil error means counts are word counts,
+// so any token-savings figure measured in that state is not valid.
+func TokenizerStatus() error {
+	_, err := getGlobalTiktokenCodec()
+	return err
 }
 
 // CleanDocument represents a structured document after HTML boilerplate removal.

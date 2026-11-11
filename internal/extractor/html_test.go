@@ -295,7 +295,9 @@ console.log("Telemetry initialized for doc page v1.5");
 	t.Logf("Token Reduction       : %.2f%%", reductionPct)
 	t.Logf("\n--- EXACT CLEAN MARKDOWN EXTRACTED ---\n%s\n--------------------------------------", cleanMarkdown)
 
-	if reductionPct < 80.0 {
+	if err := TokenizerStatus(); err != nil {
+		t.Logf("tokenizer unavailable (%v): counts above are word counts, skipping the BPE reduction check", err)
+	} else if reductionPct < 80.0 {
 		t.Errorf("Expected token reduction >= 80%%, got %.2f%%", reductionPct)
 	}
 
@@ -323,6 +325,9 @@ console.log("Telemetry initialized for doc page v1.5");
 }
 
 func TestTokenReduction_LiveGoDocs(t *testing.T) {
+	if err := TokenizerStatus(); err != nil {
+		t.Skipf("cl100k_base tokenizer unavailable (%v); a reduction figure would be based on word counts", err)
+	}
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Get("https://go.dev/doc/tutorial/getting-started")
 	if err != nil {
@@ -356,3 +361,14 @@ func TestTokenReduction_LiveGoDocs(t *testing.T) {
 	t.Logf("========================================================")
 }
 
+
+// The tokenizer must count real BPE tokens: a long word is several tokens,
+// while the word-count fallback would report 1.
+func TestCountBPETokens_IsRealBPE(t *testing.T) {
+	if err := TokenizerStatus(); err != nil {
+		t.Skipf("cl100k_base tokenizer unavailable: %v", err)
+	}
+	if n := CountBPETokens("antidisestablishmentarianism"); n <= 1 {
+		t.Fatalf("expected several BPE tokens, got %d (word-count fallback?)", n)
+	}
+}
